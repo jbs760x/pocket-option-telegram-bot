@@ -1,1 +1,0 @@
-# pocket-option-telegram-bot
