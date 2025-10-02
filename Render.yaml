@@ -3,5 +3,8 @@ services:
     name: po-bot
     env: python
     plan: starter
-    buildCommand: pip install --upgrade --force-reinstall --no-cache-dir -r requirements.txt
+    buildCommand: |
+      pip uninstall -y telegram python-telegram-bot || true
+      pip cache purge || true
+      pip install --upgrade --force-reinstall --no-cache-dir -r requirements.txt
     startCommand: python telegram_bot.py
