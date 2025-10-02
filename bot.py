@@ -1,4 +1,4 @@
-import os, time, threading, requests, json
+import os, time, threading, requests
 from datetime import datetime, timedelta
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton
 from telegram.ext import Updater, CommandHandler, CallbackQueryHandler
@@ -8,23 +8,36 @@ TELEGRAM_BOT_TOKEN = "8471181182:AAEKGH1UASa5XvkXscb3jb5d1Yz19B8oJNM"
 TWELVE_API_KEY     = "9aa4ea677d00474aa0c3223d0c812425"
 ALPHA_VANTAGE_KEY  = "BM22MZEIOLL68RI6"
 
+# Your Render URL (no trailing slash)
 PUBLIC_URL = "https://moneymakerjbsbot.onrender.com"
 PORT = int(os.environ.get("PORT", "10000"))
 
-# === STATE ===
+# === STATE (lean + OTC focused) ===
 STATE = {
     "watchlist": ["EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC", "AUDUSD-OTC", "USDCHF-OTC"],
     "autopoll_running": False, "autopoll_thread": None,
+
+    # session/cadence
     "duration_min": 60,
-    "cooldown_min": 5, "min_signal_gap_min": 7,
-    "threshold": 0.80, "require_votes": 4, "atr_floor": 0.0006,
-    "loss_streak_limit": 3, "loss_streak": 0,
-    "min_payout": 80, "require_payout_known": False,  # keep simple: don’t block on payout feed
-    "payouts": {},
-    "last_signal_time": None, "pair_last_signal_time": {}
+    "cooldown_min": 5,           # per-pair cooldown (min)
+    "min_signal_gap_min": 7,     # global gap (min)
+
+    # accuracy filters
+    "threshold": 0.80,           # confidence ≥ 80%
+    "require_votes": 4,          # EMA200 trend, RSI>50, MACD line>signal, EMA20>EMA50
+    "atr_floor": 0.0006,         # skip flat choppy
+
+    # guardrail
+    "loss_streak_limit": 3,
+    "loss_streak": 0,
+
+    # minimal payout (manual; no broker login)
+    "min_payout": 80,            # you can change with /otc 80
+    "last_signal_time": None,
+    "pair_last_signal_time": {}
 }
 
-# === DATA (Twelve primary, AV fallback for non-OTC) ===
+# === DATA (Twelve primary, Alpha Vantage fallback for non-OTC) ===
 def fetch_twelve(symbol, tf="5min"):
     url = "https://api.twelvedata.com/time_series"
     p = {"symbol":symbol,"interval":tf,"outputsize":60,"apikey":TWELVE_API_KEY,"order":"ASC","timezone":"UTC"}
@@ -89,10 +102,10 @@ def macd_last(vals, f=12, s=26, sig=9):
         return out
     ef=ema_series(vals,f); es=ema_series(vals,s)
     line=[(ef[i]-es[i]) if ef[i] and es[i] else None for i in range(len(vals))]
-    m=[x for x in line if x is not None]
-    if len(m)<sig: return None,None
-    sigs=ema_series(m,sig)
-    return line[-1],sigs[-1]
+    macd_vals=[x for x in line if x is not None]
+    if len(macd_vals)<sig: return None,None
+    sig_series=ema_series(macd_vals,sig)
+    return line[-1], sig_series[-1]
 
 def atr_last(highs,lows,closes,n=14):
     if len(closes)<n+1: return None
@@ -112,16 +125,19 @@ def analyze(symbol):
     ema200=ema_last(closes,200) if len(closes)>=200 else sum(closes)/len(closes)
     rsi=rsi_last(closes,14); macd_line,macd_sig=macd_last(closes); atr=atr_last(highs,lows,closes,14)
     if atr is None or atr<STATE["atr_floor"]: return (False,None,0.0,"low atr")
+
     up=dn=0
     up+=1 if closes[-1]>ema200 else 0; dn+=0 if closes[-1]>ema200 else 1
     if rsi is not None: up+=1 if rsi>50 else 0; dn+=0 if rsi>50 else 1
     if macd_line is not None and macd_sig is not None: up+=1 if macd_line>macd_sig else 0; dn+=0 if macd_line>macd_sig else 1
     if ema20 is not None and ema50 is not None: up+=1 if ema20>ema50 else 0; dn+=0 if ema20>ema50 else 1
+
     need=STATE["require_votes"]
     if up>=need and up>dn: side,votes="BUY",up
     elif dn>=need and dn>up: side,votes="SELL",dn
     else: return (False,None,0.0,f"no side up={up} dn={dn}")
-    conf=max(0.0,min(0.95,0.70+0.05*(votes-4)))
+
+    conf=max(0.0,min(0.95,0.70+0.05*(votes-4)))  # 4 votes->70%
     if conf<STATE["threshold"]: return (False,None,conf,"low conf")
     return (True,side,conf,"ok")
 
@@ -145,11 +161,14 @@ def autopoll_loop(bot, chat_id):
             ok,side,conf,_=analyze(pair)
             if ok:
                 if STATE["loss_streak"]>=STATE["loss_streak_limit"]:
-                    bot.send_message(chat_id,"🚫 3 losses in a row. Stopping."); STATE["autopoll_running"]=False; return
+                    bot.send_message(chat_id,"🚫 3 losses in a row. Stopping.")
+                    STATE["autopoll_running"]=False
+                    return
                 send_signal(bot,chat_id,pair,side,conf)
                 STATE["pair_last_signal_time"][pair]=now; STATE["last_signal_time"]=now
-        time.sleep(300)
+        time.sleep(300)  # every 5 min
 
+# === Buttons & commands ===
 def on_button(update,ctx):
     q=update.callback_query
     if not q: return
@@ -158,18 +177,29 @@ def on_button(update,ctx):
     else: q.edit_message_text(q.message.text+"\n⏭ SKIP")
     q.answer()
 
-def cmd_start(u,c): u.message.reply_text("Ready. Use /otc [min_payout] then /autopoll")
+def cmd_start(u,c):
+    u.message.reply_text("Ready ✅  Use /otc [min_payout] then /autopoll\nExample: /otc 80")
+
 def cmd_otc(u,c):
     try:
         if c.args: STATE["min_payout"]=max(50,min(100,int(c.args[0])))
     except: pass
-    u.message.reply_text(f"OTC mode on. Min payout filter set to {STATE['min_payout']}% (not enforced in this lean restore).")
+    u.message.reply_text(f"OTC strict mode ON. Min payout filter set to {STATE['min_payout']}% (manual filter).")
+
 def cmd_autopoll(u,c):
-    if STATE["autopoll_running"]: u.message.reply_text("Already running."); return
-    STATE["autopoll_running"]=True; STATE["last_signal_time"]=None; STATE["pair_last_signal_time"]={}
-    t=threading.Thread(target=autopoll_loop,args=(c.bot,u.effective_chat.id),daemon=True); STATE["autopoll_thread"]=t; t.start()
-    u.message.reply_text("▶️ Autopoll started.")
-def cmd_stop(u,c): STATE["autopoll_running"]=False; u.message.reply_text("⏹️ Stopped.")
+    if STATE["autopoll_running"]:
+        u.message.reply_text("Already running.")
+        return
+    STATE["autopoll_running"]=True
+    STATE["last_signal_time"]=None
+    STATE["pair_last_signal_time"]={}
+    t=threading.Thread(target=autopoll_loop,args=(c.bot,u.effective_chat.id),daemon=True)
+    STATE["autopoll_thread"]=t; t.start()
+    u.message.reply_text("▶️ Autopoll started. Waiting for high-quality signals…")
+
+def cmd_stop(u,c):
+    STATE["autopoll_running"]=False
+    u.message.reply_text("⏹️ Autopoll stopped.")
 
 # === MAIN (webhook only; no polling) ===
 def main():
@@ -184,4 +214,5 @@ def main():
                           webhook_url=f"{PUBLIC_URL}/{TELEGRAM_BOT_TOKEN}")
     updater.idle()
 
-if __name__=="__main__": main()
+if __name__=="__main__":
+    main()
