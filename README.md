@@ -1,6 +1,6 @@
 ## Run
 - Deploy as a Render Background Worker
-- Start command: python telegram_bot.py
+- Start command: python bot.py
 
 ## Telegram (copy-paste)
 /start
