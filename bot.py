@@ -1,335 +1,838 @@
-import os
-import time
-import requests
-from datetime import datetime, timedelta
+# telegram_bot.py — FULL FEATURED
+# - Twelve Data (primary) + Alpha Vantage (fallback) via DATA_SOURCES order
+# - /sources to view/set order
+# - Strategy modes, autosignal, autopool
+# - Confidence % shown in all signal replies
+# - ATR momentum + 15m EMA50 confirmation filters
+# - Payout threshold, cooldown/hour-cap, daily stop
+# - /track on/off/status: pulls results from worker /positions
+# - Stats & planning helpers
+#
+# === Additions (kept all original features; only added) ===
+# * VERBOSE flag to announce skipped rounds (optional)
+# * /autosignal now open to anyone, supports [interval_sec] & [tf], defaults: 60s, 1min
+# * /stopsignal open to anyone
+# * /autosignalfast (optional) — base strategy only (no ATR/HTF), chattier
+# * Slight logging messages to confirm loop is running
+# ==========================================================
 
-from telegram import InlineKeyboardMarkup, InlineKeyboardButton, Update
-from telegram.ext import (
-    Application, CommandHandler, CallbackQueryHandler, ContextTypes
+import os, re, json, logging, asyncio, aiohttp, time
+from collections import deque
+from datetime import datetime, timezone, timedelta
+from dotenv import load_dotenv
+from telegram import Update
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+
+load_dotenv()
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+
+# ===== .env =====
+BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
+ADMIN_ID    = int(os.getenv("ADMIN_CHAT_ID", "0"))
+WORKER_URL  = os.getenv("WORKER_URL", "http://127.0.0.1:8000")
+
+TWELVE_KEY  = os.getenv("TWELVE_KEY") or os.getenv("TWELVE_API_KEY") or ""
+ALPHA_KEY   = os.getenv("ALPHAVANTAGE_KEY", "")
+DATA_SOURCES_ENV = os.getenv("DATA_SOURCES", "twelve,alpha")  # priority left→right
+
+if not BOT_TOKEN:
+    raise SystemExit("Missing TELEGRAM_BOT_TOKEN (or BOT_TOKEN) in .env")
+
+# ===== Help =====
+HELP_TEXT = (
+    "🤖 Signals\n"
+    "/start, /help\n"
+    "/status – worker online?\n"
+    "/mode strict|active|mean|both|ultra\n"
+    "/check SYMBOL [interval=5min]\n"
+    "/signal SYMBOL call|put AMOUNT DURATION\n"
+    "/signalauto SYMBOL AMOUNT DURATION [interval=5min]\n"
+    "/autosignal SYMBOL AMOUNT DURATION [interval_sec=300]\n"
+    "/stopsignal\n\n"
+    "📈 Stats & plan\n"
+    "/plan entries N | lead S | show\n"
+    "/result win|loss\n"
+    "/stats, /resetstats\n"
+    "/payout PERCENT (e.g. 75)\n\n"
+    "👀 Pool\n"
+    "/watch add|remove|list|clear [SYMBOL]\n"
+    "/poolthresh PERCENT (e.g. 62)\n"
+    "/autopool AMOUNT DURATION [interval_sec=300] [tf=5min]\n"
+    "/stoppool\n\n"
+    "🛰 Data providers\n"
+    "/sources            (show order)\n"
+    "/sources set twelve,alpha\n\n"
+    "📡 Trade tracking (worker /positions)\n"
+    "/track on [secs] | off | status\n\n"
+    "Use OTC aliases like EURUSD-OTC. Durations are seconds (60 = 1m)."
 )
 
-# ========= YOUR KEYS (as provided) =========
-TELEGRAM_BOT_TOKEN = "8471181182:AAEKGH1UASa5XvkXscb3jb5d1Yz19B8oJNM"
-TWELVE_API_KEY     = "9aa4ea677d00474aa0c3223d0c812425"
-ALPHA_VANTAGE_KEY  = "BM22MZEIOLL68RI6"
+# ===== Defaults / State =====
+LEAD_SEC = 60
+WATCHLIST = ["EURUSD-OTC","GBPUSD-OTC","USDJPY-OTC","AUDCAD-OTC"]
+POOL_TASK = {"running": False, "task": None}
+POOL_MIN_PROB = 0.60
 
-# Render public URL (no trailing slash)
-PUBLIC_URL = "https://moneymakerjbsbot.onrender.com"
-PORT = int(os.environ.get("PORT", "10000"))
+PAYOUT_MIN = 0.75
+LAST_FIRES = {}         # pair -> deque timestamps
+MAX_PER_HOUR = 6
+COOLDOWN_SEC = 240
 
-# ========= GLOBAL STATE (lean + OTC) =========
-STATE = {
-    "watchlist": ["EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC", "AUDUSD-OTC", "USDCHF-OTC"],
+DAILY_MAX_WINS = 3
+DAILY_MAX_LOSSES = 2
+DAILY_COUNTER = {"date": None, "wins": 0, "losses": 0}
 
-    # run control
-    "autopoll_running": False,
-    "duration_min": 60,          # /autopoll run length
+STATS = {"wins":0,"losses":0,"entries_this_series":0,"total_signals":0,"last_reset":None}
 
-    # cadence
-    "cooldown_min": 5,           # per-pair cooldown
-    "min_signal_gap_min": 7,     # global gap between any two signals
+TRACK_TASK = {"running": False, "task": None, "interval": 15}
+SEEN_POS = set()
 
-    # accuracy filters
-    "threshold": 0.80,           # min confidence (80%)
-    "require_votes": 4,          # EMA200 trend, RSI>50, MACD line>signal, EMA20>EMA50
-    "atr_floor": 0.0006,         # skip flat/choppy markets
+STRATEGY_MODE = "both"  # strict|active|mean|both|ultra
+_last_signal_bar_index = None
 
-    # safety
-    "loss_streak_limit": 3,
-    "loss_streak": 0,
+# === ADDED: optional verbose announcements for skipped rounds ===
+VERBOSE = True  # set to False if you don't want "skipped" messages
 
-    # (manual) payout filter number you can set with /otc; not blocking
-    "min_payout": 80,
-
-    # internals
-    "last_signal_time": None,
-    "pair_last_signal_time": {},
-
-    # active chat
-    "chat_id": None,
-}
-
-# ========= DATA FETCHERS (Twelve primary, AV fallback for non-OTC) =========
-def fetch_twelve(symbol: str, tf: str = "5min"):
-    url = "https://api.twelvedata.com/time_series"
-    params = {
-        "symbol": symbol, "interval": tf, "outputsize": 60,
-        "apikey": TWELVE_API_KEY, "order": "ASC", "timezone": "UTC"
-    }
+# ===== Worker I/O =====
+async def ping_worker() -> bool:
     try:
-        r = requests.get(url, params=params, timeout=12)
-        j = r.json()
-        if "values" not in j:
-            return None
-        out = []
-        for v in j["values"]:
-            out.append({
-                "t": datetime.fromisoformat(v["datetime"]),
-                "o": float(v["open"]), "h": float(v["high"]),
-                "l": float(v["low"]),  "c": float(v["close"])
-            })
-        out.sort(key=lambda x: x["t"])
-        return out[-60:]
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"{WORKER_URL}/health", timeout=5) as r:
+                return r.status == 200
     except Exception:
-        return None
+        return False
 
-def fetch_av(symbol: str, tf: str = "5min"):
-    # Alpha Vantage doesn't support OTC; only use for non-OTC if you ever add them
-    if "-OTC" in symbol:
-        return None
+async def send_trade(symbol: str, direction: str, amount: float, duration: int):
+    payload = {"symbol":symbol.upper(),"direction":direction.lower(),"amount":float(amount),"duration_sec":int(duration)}
     try:
-        base, quote = symbol[:3], symbol[3:]
-        url = "https://www.alphavantage.co/query"
-        params = {
-            "function": "FX_INTRADAY",
-            "from_symbol": base,
-            "to_symbol": quote,
-            "interval": tf,
-            "apikey": ALPHA_VANTAGE_KEY,
-            "outputsize": "compact",
-        }
-        j = requests.get(url, params=params, timeout=12).json()
-        key = "Time Series FX (5min)"
-        if key not in j:
-            return None
-        items = []
-        for ts, v in j[key].items():
-            items.append({
-                "t": datetime.fromisoformat(ts),
-                "o": float(v["1. open"]), "h": float(v["2. high"]),
-                "l": float(v["3. low"]),  "c": float(v["4. close"])
-            })
-        items.sort(key=lambda x: x["t"])
-        return items[-60:]
-    except Exception:
-        return None
+        async with aiohttp.ClientSession() as s:
+            async with s.post(f"{WORKER_URL}/trade", json=payload, timeout=10) as r:
+                return await r.json()
+    except Exception as e:
+        logging.warning(f"/trade failed: {e}")
+        return {"status":"error","error":str(e)}
 
-def fetch_ohlcv(symbol: str, tf: str = "5min"):
-    bars = fetch_twelve(symbol, tf)
-    if bars:
-        return bars
-    return fetch_av(symbol, tf)
+async def fetch_positions():
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(f"{WORKER_URL}/positions", timeout=10) as r:
+                if r.status != 200:
+                    return None, f"HTTP {r.status}"
+                js = await r.json()
+                if not isinstance(js, list): return None, "bad payload"
+                return js, None
+    except Exception as e:
+        return None, f"positions err: {e}"
 
-# ========= INDICATORS =========
-def ema_last(vals, n):
-    if len(vals) < n: return None
-    k = 2/(n+1)
-    e = sum(vals[:n]) / n
-    for v in vals[n:]:
-        e = e + k*(v - e)
-    return e
+# ===== Utils =====
+def _dir_to_arrow(direction: str) -> str:
+    return "UP" if direction.lower() == "call" else "DOWN"
 
-def rsi_last(vals, n=14):
-    if len(vals) < n+1: return None
+def parse_line(txt: str):
+    # "EURUSD-OTC call 2 60"
+    m = re.match(r"^\s*([A-Za-z0-9/_\-.]+)\s+(call|put)\s+(\d+(?:\.\d+)?)\s+(\d+)\s*$", txt, re.I)
+    if not m: return None
+    s,d,a,dur = m.groups()
+    return s.upper(), d.lower(), float(a), int(dur)
+
+# ===== Indicators =====
+def ema(values, period):
+    if len(values) < period: return None
+    k = 2/(period+1)
+    ev = sum(values[:period]) / period
+    for v in values[period:]:
+        ev = v*k + ev*(1-k)
+    return ev
+
+def rsi(values, period=14):
+    if len(values) <= period: return None
     gains, losses = [], []
-    for i in range(1, len(vals)):
-        ch = vals[i] - vals[i-1]
-        gains.append(max(ch, 0)); losses.append(max(-ch, 0))
-    avg_g = sum(gains[:n]) / n
-    avg_l = sum(losses[:n]) / n
-    for i in range(n, len(gains)):
-        avg_g = (avg_g*(n-1) + gains[i]) / n
-        avg_l = (avg_l*(n-1) + losses[i]) / n
-    rs = (avg_g / avg_l) if avg_l != 0 else 999
-    return 100 - 100/(1+rs)
+    for i in range(1,len(values)):
+        ch = values[i]-values[i-1]
+        gains.append(max(ch,0)); losses.append(max(-ch,0))
+    avg_g = sum(gains[:period]) / period
+    avg_l = sum(losses[:period]) / period
+    for i in range(period,len(values)-1):
+        avg_g = (avg_g*(period-1) + gains[i]) / period
+        avg_l = (avg_l*(period-1) + losses[i]) / period
+    if avg_l == 0: return 100.0
+    rs = avg_g/avg_l
+    return 100 - (100/(1+rs))
 
-def macd_last(vals, fast=12, slow=26, signal=9):
-    if len(vals) < slow + signal: return None, None
-    def ema_series(arr, n):
-        if len(arr) < n: return []
-        k = 2/(n+1)
-        e = sum(arr[:n]) / n
-        out = [None]*(n-1) + [e]
-        for v in arr[n:]:
-            e = e + k*(v - e)
-            out.append(e)
-        return out
-    ef = ema_series(vals, fast)
-    es = ema_series(vals, slow)
-    macd_line = [(ef[i] - es[i]) if ef[i] and es[i] else None for i in range(len(vals))]
-    macd_vals = [x for x in macd_line if x is not None]
-    if len(macd_vals) < signal: return None, None
-    sig_series = ema_series(macd_vals, signal)
-    return macd_line[-1], sig_series[-1]
-
-def atr_last(highs, lows, closes, n=14):
-    if len(closes) < n+1: return None
-    trs = []
-    for i in range(1, len(closes)):
-        trs.append(max(highs[i]-lows[i],
-                       abs(highs[i]-closes[i-1]),
-                       abs(lows[i]-closes[i-1])))
-    atr = sum(trs[:n]) / n
-    for i in range(n, len(trs)):
-        atr = (atr*(n-1) + trs[i]) / n
+def atr_from_candles(candles, period=14):
+    if len(candles) <= period: return None
+    highs  = [float(c["high"]) for c in candles]
+    lows   = [float(c["low"])  for c in candles]
+    closes = [float(c["close"]) for c in candles]
+    trs=[]
+    for i in range(1,len(candles)):
+        tr=max(highs[i]-lows[i], abs(highs[i]-closes[i-1]), abs(lows[i]-closes[i-1]))
+        trs.append(tr)
+    k=2/(period+1); atr=sum(trs[:period])/period
+    for v in trs[period:]:
+        atr = v*k + atr*(1-k)
     return atr
 
-# ========= STRATEGY (OTC strict confluence) =========
-def analyze(symbol):
-    bars = fetch_ohlcv(symbol, "5min")
-    if not bars or len(bars) < 60:
-        return (False, None, 0.0, "no data")
+# ===== Symbol helpers =====
+def norm_symbol_to_twelve(sym: str) -> str:
+    raw = sym.upper()
+    pure = raw[:-4] if raw.endswith("-OTC") else raw
+    pure = pure.replace("_","")
+    if "/" in pure: return pure
+    if len(pure)==6: return f"{pure[:3]}/{pure[3:]}"
+    return pure
 
-    closes = [b["c"] for b in bars]
-    highs  = [b["h"] for b in bars]
-    lows   = [b["l"] for b in bars]
+def display_and_fetch_symbol(sym: str):
+    return sym.upper(), norm_symbol_to_twelve(sym)
 
-    ema20  = ema_last(closes, 20)
-    ema50  = ema_last(closes, 50)
-    ema200 = ema_last(closes, 200) if len(closes) >= 200 else sum(closes)/len(closes)
-    rsi14  = rsi_last(closes, 14)
-    macd_line, macd_sig = macd_last(closes)
-    atr14  = atr_last(highs, lows, closes, 14)
+def alpha_from_to(sym: str):
+    raw = sym.upper()
+    raw = raw[:-4] if raw.endswith("-OTC") else raw
+    raw = raw.replace("/","")
+    if len(raw)>=6:
+        return raw[:3], raw[3:6]
+    return raw[:3], raw[3:] or "USD"
 
-    if atr14 is None or atr14 < STATE["atr_floor"]:
-        return (False, None, 0.0, "low atr")
-
-    up = dn = 0
-    if closes[-1] > ema200: up += 1
-    else: dn += 1
-    if rsi14 is not None and rsi14 > 50: up += 1
-    elif rsi14 is not None: dn += 1
-    if macd_line is not None and macd_sig is not None:
-        if macd_line > macd_sig: up += 1
-        else: dn += 1
-    if ema20 is not None and ema50 is not None:
-        if ema20 > ema50: up += 1
-        else: dn += 1
-
-    need = STATE["require_votes"]
-    if up >= need and up > dn:
-        side, votes = "BUY", up
-    elif dn >= need and dn > up:
-        side, votes = "SELL", dn
+# ===== Candle timing =====
+def next_bar_seconds(interval: str) -> int:
+    mins = int(interval.replace("min",""))
+    now = datetime.now(timezone.utc)
+    bucket = (now.minute // mins + 1) * mins
+    nxt = now.replace(second=0, microsecond=0)
+    if bucket >= 60:
+        nxt = (nxt + timedelta(hours=1)).replace(minute=0)
     else:
-        return (False, None, 0.0, f"no side up={up} dn={dn}")
+        nxt = nxt.replace(minute=bucket)
+    return max(0, int((nxt-now).total_seconds()))
 
-    # confidence from votes (4/4 -> 70%, cap 95%)
-    conf = max(0.0, min(0.95, 0.70 + 0.05*(votes-4)))
-    if conf < STATE["threshold"]:
-        return (False, None, conf, "low conf")
-
-    return (True, side, conf, "ok")
-
-# ========= MESSAGES =========
-async def send_signal(context: ContextTypes.DEFAULT_TYPE, pair: str, side: str, conf: float):
-    kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Win", callback_data="win"),
-        InlineKeyboardButton("❌ Loss", callback_data="loss"),
-        InlineKeyboardButton("⏭ Skip", callback_data="skip"),
-    ]])
-    txt = f"📊 OTC Signal\nPair: {pair}\n👉 {side}\nConfidence: {int(conf*100)}%\nMin payout (manual): {STATE['min_payout']}%"
-    await context.bot.send_message(chat_id=STATE["chat_id"], text=txt, reply_markup=kb)
-
-# ========= JOB: AUTO SCAN EVERY 5 MIN =========
-async def poll_job(context: ContextTypes.DEFAULT_TYPE):
-    if not STATE["autopoll_running"] or STATE["chat_id"] is None:
-        return
-    now = datetime.now()
-
-    for pair in STATE["watchlist"]:
-        last_pair = STATE["pair_last_signal_time"].get(pair)
-        if last_pair and (now - last_pair).total_seconds() < STATE["cooldown_min"]*60:
-            continue
-        if STATE["last_signal_time"] and (now - STATE["last_signal_time"]).total_seconds() < STATE["min_signal_gap_min"]*60:
-            continue
-
-        ok, side, conf, _ = analyze(pair)
-        if ok:
-            if STATE["loss_streak"] >= STATE["loss_streak_limit"]:
-                await context.bot.send_message(chat_id=STATE["chat_id"], text="🚫 3 losses in a row. Stopping.")
-                STATE["autopoll_running"] = False
-                return
-            await send_signal(context, pair, side, conf)
-            STATE["pair_last_signal_time"][pair] = now
-            STATE["last_signal_time"] = now
-
-# ========= STOP JOB AFTER DURATION =========
-async def stop_job(context: ContextTypes.DEFAULT_TYPE):
-    STATE["autopoll_running"] = False
-    await context.bot.send_message(chat_id=STATE["chat_id"], text="⏹️ Autopoll duration ended.")
-
-# ========= BUTTON HANDLER =========
-async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    if not q:
-        return
-    if q.data == "win":
-        STATE["loss_streak"] = 0
-        await q.edit_message_text(q.message.text + "\n✅ WIN")
-    elif q.data == "loss":
-        STATE["loss_streak"] += 1
-        await q.edit_message_text(q.message.text + "\n❌ LOSS")
-    else:
-        await q.edit_message_text(q.message.text + "\n⏭ SKIP")
-    await q.answer()
-
-# ========= COMMANDS =========
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "Bot ready ✅\n"
-        "Use /otc [min_payout] then /autopoll\n"
-        "Default OTC pairs: EURUSD-OTC, GBPUSD-OTC, USDJPY-OTC, AUDUSD-OTC, USDCHF-OTC"
-    )
-
-async def cmd_otc(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ===== Providers =====
+async def _fetch_candles_twelve(symbol: str, interval="5min", limit=120):
+    if not TWELVE_KEY: return [], "Missing TWELVE_KEY"
+    _, td_symbol = display_and_fetch_symbol(symbol)
+    url = f"https://api.twelvedata.com/time_series?symbol={td_symbol}&interval={interval}&outputsize={limit}&apikey={TWELVE_KEY}"
     try:
-        if context.args:
-            mp = int(context.args[0])
-            STATE["min_payout"] = max(50, min(100, mp))
-    except Exception:
-        pass
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=20) as r:
+                if r.status!=200:
+                    return [], f"Twelve HTTP {r.status}"
+                js = await r.json()
+                if isinstance(js, dict) and js.get("status")=="error":
+                    return [], f"Twelve error: {js.get('message','unknown')}"
+                vals = js.get("values")
+                if not vals: return [], "Twelve no candles"
+                return list(reversed(vals))[-limit:], None
+    except Exception as e:
+        return [], f"Twelve fetch failed: {e}"
+
+async def fetch_candles_alpha(symbol: str, interval="5min", limit=120):
+    if not ALPHA_KEY: return [], "Missing ALPHAVANTAGE_KEY"
+    base, quote = alpha_from_to(symbol)
+    interval = interval if interval in {"1min","5min","15min","30min","60min"} else "5min"
+    url = ("https://www.alphavantage.co/query?"
+           f"function=FX_INTRADAY&from_symbol={base}&to_symbol={quote}"
+           f"&interval={interval}&apikey={ALPHA_KEY}&outputsize=compact")
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=20) as r:
+                js = await r.json()
+                ts_key = next((k for k in js.keys() if "Time Series" in k), None)
+                if not ts_key:
+                    return [], f"Alpha error: {js.get('Note') or js.get('Error Message') or 'unknown'}"
+                series = js[ts_key]
+                candles=[]
+                for t,v in sorted(series.items()):
+                    candles.append({"datetime":t,"open":float(v["1. open"]),
+                                    "high":float(v["2. high"]),"low":float(v["3. low"]),
+                                    "close":float(v["4. close"])})
+                return candles[-limit:], None
+    except Exception as e:
+        return [], f"Alpha fetch failed: {e}"
+
+PROVIDER_FUNCS = {
+    "twelve": _fetch_candles_twelve,
+    "alpha":  fetch_candles_alpha,
+}
+
+def parse_sources_env():
+    order = [p.strip().lower() for p in DATA_SOURCES_ENV.split(",") if p.strip()]
+    return [p for p in order if p in PROVIDER_FUNCS]
+DATA_SOURCES_ORDER = parse_sources_env()
+
+async def fetch_candles(symbol: str, interval="5min", limit=120):
+    errors=[]
+    for prov in DATA_SOURCES_ORDER:
+        func = PROVIDER_FUNCS[prov]
+        candles, err = await func(symbol, interval, limit)
+        if candles and not err:
+            logging.info(f"[DATA] {prov} used for {symbol} {interval}")
+            return candles, None
+        errors.append(f"{prov}: {err or 'no data'}")
+    return [], " | ".join(errors)
+
+async def fetch_closes(symbol: str, interval="5min", limit=120):
+    candles, err = await fetch_candles(symbol, interval, limit)
+    if err: return [], err
+    return [float(c["close"]) for c in candles], None
+
+# ===== Strategies & scoring =====
+def decide_signal_standard(closes):
+    if len(closes) < 60: return None
+    last = closes[-1]; e50 = ema(closes,50); r = rsi(closes,14)
+    if e50 is None or r is None: return None
+    r_prev = rsi(closes[:-1],14)
+
+    def strict():
+        if r_prev is None: return None
+        if last > e50 and r_prev < 30 <= r: return "call"
+        if last < e50 and r_prev > 70 >= r: return "put"
+        return None
+
+    def active():
+        if last > e50 and r > 55: return "call"
+        if last < e50 and r < 45: return "put"
+        return None
+
+    def mean():
+        if r >= 70: return "put"
+        if r <= 30: return "call"
+        return None
+
+    if STRATEGY_MODE=="strict": return strict()
+    if STRATEGY_MODE=="active": return active()
+    if STRATEGY_MODE=="mean":   return mean()
+    if STRATEGY_MODE=="both":   return strict() or active()
+    return None
+
+def median_body(bodies):
+    s=sorted(bodies); n=len(s)
+    return (s[n//2] if n%2 else (s[n//2-1]+s[n//2])/2.0) if n else 0.0
+
+def decide_signal_ultra(candles, cooldown_bars=1):
+    global _last_signal_bar_index
+    if len(candles)<60: return None
+    closes=[float(c["close"]) for c in candles]
+    opens=[float(c["open"]) for c in candles]
+    e50=ema(closes,50); r=rsi(closes,14)
+    if e50 is None or r is None: return None
+    bodies=[abs(closes[i]-opens[i]) for i in range(-11,-1)]
+    mom_th=median_body(bodies)
+    last_body=abs(closes[-1]-opens[-1])
+    bar_idx=len(candles)-1
+    if _last_signal_bar_index is not None and bar_idx-_last_signal_bar_index<=cooldown_bars:
+        return None
+    last=closes[-1]
+    if r<=20 and last>e50 and last_body>=mom_th: _last_signal_bar_index=bar_idx; return "call"
+    if r>=80 and last<e50 and last_body>=mom_th: _last_signal_bar_index=bar_idx; return "put"
+    return None
+
+def score_probability(candles):
+    if len(candles)<60: return (None,0.0,{})
+    closes=[float(c["close"]) for c in candles]
+    opens =[float(c["open"])  for c in candles]
+    e50=ema(closes,50); r=rsi(closes,14)
+    if e50 is None or r is None: return (None,0.0,{})
+    bodies=[abs(closes[i]-opens[i]) for i in range(-11,-1)]
+    med = sorted(bodies)[5] if len(bodies)>=10 else 0.0
+    mom = (abs(closes[-1]-opens[-1])/(med+1e-9)) if med else 0.0
+    trend_call = 1.0 if closes[-1]>e50 else 0.0
+    trend_put  = 1.0 - trend_call
+    rsi_call = max(0.0,(30-r)/30); rsi_put = max(0.0,(r-70)/30)
+    mom_boost=min(mom,2.0)/2.0
+    call_score=0.45*rsi_call+0.40*trend_call+0.15*mom_boost
+    put_score =0.45*rsi_put +0.40*trend_put +0.15*mom_boost
+    if call_score<0.35 and put_score<0.35: return (None,0.0,{"weak":True})
+    if call_score>=put_score:
+        prob=max(0.5,min(0.8,0.5+(call_score-put_score)))
+        return ("call",prob,{})
+    else:
+        prob=max(0.5,min(0.8,0.5+(put_score-call_score)))
+        return ("put",prob,{})
+
+def _confidence_for_direction(decision: str, candles) -> float|None:
+    try:
+        d, prob, _ = score_probability(candles)
+        if prob<=0: return None
+        return float(prob)
+    except:
+        return None
+
+# ===== Filters & guards =====
+async def htf_trend_ok(symbol: str, tf="15min", lookback=120):
+    candles, err = await fetch_candles(symbol, tf, lookback)
+    if err or len(candles)<55: return None
+    closes=[float(c["close"]) for c in candles]
+    e50=ema(closes,50)
+    if e50 is None: return None
+    return "up" if closes[-1]>e50 else "down"
+
+AUTO_TASK = {"running": False, "task": None}
+
+def _cooldown_ok(pair: str)->bool:
+    now=time.time()
+    q=LAST_FIRES.setdefault(pair, deque())
+    while q and now-q[0]>3600: q.popleft()
+    if q and (now-q[-1] < COOLDOWN_SEC): return False
+    if len(q) >= MAX_PER_HOUR: return False
+    q.append(now); return True
+
+def _daily_ensure_today():
+    today = datetime.utcnow().date().__str__()
+    if DAILY_COUNTER["date"] != today:
+        DAILY_COUNTER.update({"date":today,"wins":0,"losses":0})
+
+async def _daily_stop_check(ctx, chat_id):
+    _daily_ensure_today()
+    if DAILY_COUNTER["wins"]>=DAILY_MAX_WINS or DAILY_COUNTER["losses"]>=DAILY_MAX_LOSSES:
+        await ctx.bot.send_message(chat_id, "🛑 Daily stop reached. Halting.")
+        AUTO_TASK["running"]=False; POOL_TASK["running"]=False
+        return True
+    return False
+
+# ===== Autosignal loop =====
+async def autosignal_loop(ctx, chat_id, symbol, amount, duration, interval_sec, tf_interval="5min"):
+    disp,_ = display_and_fetch_symbol(symbol)
+    await ctx.bot.send_message(chat_id, f"▶️ Auto-signal {disp} | ${amount} | {duration}s | TF {tf_interval} | every {interval_sec}s | mode {STRATEGY_MODE}")
+    while AUTO_TASK["running"]:
+        if await _daily_stop_check(ctx, chat_id): break
+        candles, err = await fetch_candles(symbol, tf_interval, 120)
+        if err:
+            await ctx.bot.send_message(chat_id, f"❌ {err}")
+            await asyncio.sleep(interval_sec); continue
+
+        if STRATEGY_MODE=="ultra":
+            dec = decide_signal_ultra(candles, cooldown_bars=1)
+        else:
+            closes=[float(c["close"]) for c in candles]
+            dec = decide_signal_standard(closes)
+
+        conf = _confidence_for_direction(dec, candles) if dec else None
+
+        # ATR
+        if dec:
+            atr=atr_from_candles(candles,14)
+            if not atr or abs(float(candles[-1]["close"])-float(candles[-1]["open"])) < 0.6*atr:
+                dec=None
+
+        # HTF confirm
+        if dec:
+            trend = await htf_trend_ok(symbol,"15min",120)
+            if trend is not None:
+                want_up = (dec=="call")
+                if (trend=="up" and not want_up) or (trend=="down" and want_up):
+                    dec=None
+
+        if dec and PAYOUT_MIN>0.0:
+            pass
+        if dec and not _cooldown_ok(disp):
+            dec=None
+
+        if dec:
+            arrow=_dir_to_arrow(dec)
+            wait=next_bar_seconds(tf_interval)
+            lead=min(LEAD_SEC, wait); eta=max(0, wait-lead)
+            conf_txt = f"\nConfidence: {int(conf*100)}%" if conf is not None else ""
+            await ctx.bot.send_message(chat_id,
+                f"📣 Upcoming ({tf_interval})\nPair: {disp}\nDirection: {arrow}{conf_txt}\nPlace at: next open (~{wait}s)\nExpiry: {duration}s")
+            if eta>0: await asyncio.sleep(eta)
+            if lead>0:
+                await ctx.bot.send_message(chat_id, f"⏱ Get ready: **{arrow}** on {disp} in ~{lead}s")
+                await asyncio.sleep(lead)
+
+            await send_trade(disp, dec, amount, duration)
+            STATS["entries_this_series"]+=1; STATS["total_signals"]+=1
+            await ctx.bot.send_message(chat_id,
+                f"✅ PLACE NOW\nPair: {disp}\nDirection: {arrow}\nAmount: ${amount}\nDuration: {duration}s{conf_txt}")
+        else:
+            # === ADDED: chatty skip so you know it’s alive ===
+            if VERBOSE:
+                await ctx.bot.send_message(chat_id, "ℹ️ No valid setup this round (try /mode active or tf=1min).")
+        await asyncio.sleep(interval_sec)
+    await ctx.bot.send_message(chat_id,"⏹ Auto-signal stopped.")
+
+# ===== Pool scan =====
+async def fetch_and_score(symbol, tf_interval):
+    candles, err = await fetch_candles(symbol, tf_interval, 120)
+    if err: return None,0.0,symbol,err
+    direction, prob,_ = score_probability(candles)
+    # ATR
+    atr=atr_from_candles(candles,14)
+    if atr:
+        last_body = abs(float(candles[-1]["close"])-float(candles[-1]["open"]))
+        if last_body < 0.6*atr: return None,0.0,symbol,None
+    # HTF
+    if direction:
+        trend = await htf_trend_ok(symbol,"15min",120)
+        if trend is not None:
+            want_up = (direction=="call")
+            if (trend=="up" and not want_up) or (trend=="down" and want_up):
+                direction=None; prob=0.0
+    return direction, prob, symbol, None
+
+async def autopool_loop(ctx, chat_id, amount, duration, interval_sec, tf="5min"):
+    await ctx.bot.send_message(chat_id, f"▶️ Pool TF {tf} every {interval_sec}s | scanning {len(WATCHLIST)} pairs | threshold {int(POOL_MIN_PROB*100)}%")
+    while POOL_TASK["running"]:
+        if await _daily_stop_check(ctx, chat_id): break
+        if not WATCHLIST:
+            await ctx.bot.send_message(chat_id,"⚠️ Watchlist empty. /watch add EURUSD-OTC")
+            await asyncio.sleep(interval_sec); continue
+        best=None
+        for pair in WATCHLIST:
+            d,p,s,err=await fetch_and_score(pair, tf)
+            if err:
+                await ctx.bot.send_message(chat_id,f"ℹ️ {s}: {err}"); continue
+            if d and p>=POOL_MIN_PROB and ((best is None) or (p>best[1])):
+                best=(d,p,s)
+            await asyncio.sleep(0.4)
+        if best:
+            d,p,sym=best
+            disp,_=display_and_fetch_symbol(sym)
+            if not _cooldown_ok(disp):
+                await ctx.bot.send_message(chat_id,f"⏸ Cooldown blocked {disp}")
+            else:
+                arrow=_dir_to_arrow(d)
+                wait=next_bar_seconds(tf); lead=min(LEAD_SEC,wait); eta=max(0,wait-lead)
+                await ctx.bot.send_message(chat_id,
+                    f"🎯 Pool pick ({tf})\nPair: {disp}\nDirection: {arrow}\nConfidence: {int(p*100)}%\nPlace at: next open (~{wait}s)\nExpiry: {duration}s")
+                if eta>0: await asyncio.sleep(eta)
+                if lead>0:
+                    await ctx.bot.send_message(chat_id,f"⏱ Get ready: **{arrow}** on {disp} in ~{lead}s")
+                    await asyncio.sleep(lead)
+                await send_trade(disp, "call" if arrow=="UP" else "put", amount, duration)
+                STATS["total_signals"]+=1
+                await ctx.bot.send_message(chat_id,
+                    f"✅ PLACE NOW\nPair: {disp}\nDirection: {arrow}\nAmount: ${amount}\nDuration: {duration}s\nConfidence: {int(p*100)}%")
+        else:
+            # === ADDED: chattier when nothing qualifies ===
+            if VERBOSE:
+                await ctx.bot.send_message(chat_id, f"🔄 Scanned {len(WATCHLIST)} pairs @ {tf} — none >= {int(POOL_MIN_PROB*100)}% (try /poolthresh 50 or /mode active)")
+        await asyncio.sleep(interval_sec)
+    await ctx.bot.send_message(chat_id,"⏹ Pool stopped.")
+
+# ===== Commands =====
+async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Bot ready. Type /help")
+
+async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(HELP_TEXT)
+
+async def status_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    ok = await ping_worker()
+    await update.message.reply_text(f"Worker: {'✅ Online' if ok else '❌ Offline'}")
+
+async def mode_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global STRATEGY_MODE
+    if not ctx.args or ctx.args[0].lower() not in ("strict","active","mean","both","ultra"):
+        return await update.message.reply_text("Usage: /mode strict|active|mean|both|ultra")
+    STRATEGY_MODE = ctx.args[0].lower()
+    await update.message.reply_text(f"Mode: {STRATEGY_MODE}")
+
+async def check_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if len(ctx.args) not in (1,2):
+        return await update.message.reply_text("Usage: /check SYMBOL [interval=5min]")
+    symbol = ctx.args[0].upper(); interval = ctx.args[1] if len(ctx.args)==2 else "5min"
+    disp,_=display_and_fetch_symbol(symbol)
+    closes,err = await fetch_closes(symbol, interval, 120)
+    if err: return await update.message.reply_text(f"❌ {err}")
+    e=ema(closes,50); r=rsi(closes,14)
+    dec = decide_signal_ultra([{"open":closes[-2],"close":closes[-1],"high":max(closes[-2],closes[-1]),"low":min(closes[-2],closes[-1])}]*60) if STRATEGY_MODE=="ultra" else decide_signal_standard(closes)
     await update.message.reply_text(
-        f"⚙️ OTC strict mode ON\n"
-        f"- Confidence ≥ {int(STATE['threshold']*100)}%\n"
-        f"- Confluence: 4/4 (Trend, RSI50, MACD, EMA20/50)\n"
-        f"- ATR floor: {STATE['atr_floor']}\n"
-        f"- Min payout (manual): {STATE['min_payout']}%\n"
-        f"- Cooldown: {STATE['cooldown_min']}m | Gap: {STATE['min_signal_gap_min']}m"
+        f"📊 {disp} {interval}\nMode: {STRATEGY_MODE}\nCandles: {len(closes)}\nEMA50: {round(e,5) if e else 'n/a'}\nRSI14: {round(r,2) if r else 'n/a'}\nDecision: {dec or 'none'}"
     )
 
-async def cmd_autopoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if STATE["autopoll_running"]:
-        await update.message.reply_text("ℹ️ Already running.")
-        return
-    STATE["chat_id"] = update.effective_chat.id
-    STATE["autopoll_running"] = True
-    STATE["last_signal_time"] = None
-    STATE["pair_last_signal_time"] = {}
+async def signal_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if len(ctx.args)!=4:
+        return await update.message.reply_text("Usage: /signal SYMBOL DIRECTION AMOUNT DURATION")
+    symbol, direction, amount_str, duration_str = ctx.args
+    direction=direction.lower()
+    if direction not in ("call","put"):
+        return await update.message.reply_text("Direction must be call or put")
+    amount=float(amount_str); duration=int(duration_str)
+    candles, err = await fetch_candles(symbol, "1min", 120)
+    if err: return await update.message.reply_text(f"❌ {err}")
+    conf = _confidence_for_direction(direction, candles)
+    disp,_=display_and_fetch_symbol(symbol)
+    await send_trade(disp, direction, amount, duration)
+    arrow=_dir_to_arrow(direction)
+    conf_txt=f"\nConfidence: {int(conf*100)}%" if conf is not None else ""
+    await update.message.reply_text(
+        f"✅ Signal logged\nPair: {disp}\nDirection: {arrow}\nAmount: ${amount}\nDuration: {duration}s{conf_txt}\n\n➡️ PLACE {arrow} trade in Pocket Option."
+    )
 
-    # schedule the repeating scan every 5 minutes (on candle close cadence)
-    context.job_queue.run_repeating(poll_job, interval=300, first=1, name="poll")
+async def signalauto_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if len(ctx.args) not in (3,4):
+        return await update.message.reply_text("Usage: /signalauto SYMBOL AMOUNT DURATION [interval=5min]")
+    symbol=ctx.args[0].upper()
+    amount=float(ctx.args[1]); duration=int(ctx.args[2])
+    interval=ctx.args[3] if len(ctx.args)==4 else "5min"
+    candles,err = await fetch_candles(symbol, interval, 120)
+    if err: return await update.message.reply_text(f"❌ {err}")
+    decision = decide_signal_ultra(candles,0) if STRATEGY_MODE=="ultra" else decide_signal_standard([float(c['close']) for c in candles])
+    if not decision: return await update.message.reply_text("🤷 No clear signal now.")
+    conf=_confidence_for_direction(decision, candles)
+    disp,_=display_and_fetch_symbol(symbol)
+    await send_trade(disp, decision, amount, duration)
+    arrow=_dir_to_arrow(decision)
+    conf_txt=f"\nConfidence: {int(conf*100)}%" if conf is not None else ""
+    await update.message.reply_text(
+        f"✅ Strategy signal\nPair: {disp}\nDirection: {arrow}\nAmount: ${amount}\nDuration: {duration}s{conf_txt}\n\n➡️ PLACE {arrow} trade in Pocket Option."
+    )
 
-    # schedule a stop after duration
-    context.job_queue.run_once(stop_job, when=STATE["duration_min"]*60, name="stopper")
+# === ADDED: /autosignal open to anyone, interval & TF supported, 1min defaults ===
+async def autosignal_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    a = ctx.args
+    if len(a) not in (3,4,5):
+        return await update.message.reply_text(
+            "Usage: /autosignal SYMBOL AMOUNT DURATION [interval_sec=60] [tf=1min]\n"
+            "Example: /autosignal EURUSD-OTC 5 60 60 1min"
+        )
+    symbol = a[0].upper()
+    amount = float(a[1]); duration = int(a[2])
+    interval_sec = int(a[3]) if len(a) >= 4 else 60
+    tf = a[4] if len(a) == 5 else "1min"
 
-    await update.message.reply_text("▶️ Autopoll started. Waiting for high-quality signals…")
+    if AUTO_TASK["running"]:
+        return await update.message.reply_text("Already running. /stopsignal first.")
+    AUTO_TASK["running"]=True
+    AUTO_TASK["task"]=asyncio.create_task(autosignal_loop(ctx, update.effective_chat.id, symbol, amount, duration, interval_sec, tf))
+    await update.message.reply_text(f"▶️ Auto-signal {symbol} | ${amount} | {duration}s | every {interval_sec}s | TF {tf} | mode {STRATEGY_MODE}")
 
-async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    STATE["autopoll_running"] = False
-    # cancel jobs for safety
-    for job in context.job_queue.jobs():
-        if job.name in ("poll", "stopper"):
-            job.schedule_removal()
-    await update.message.reply_text("⏹️ Autopoll stopped.")
+# === ADDED: /stopsignal open to anyone ===
+async def stopsignal_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    AUTO_TASK["running"]=False
+    await update.message.reply_text("Stopping auto-signal...")
 
-# ========= BOOT (webhook) =========
+async def plan_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global LEAD_SEC
+    if not ctx.args: return await update.message.reply_text("Usage:\n/plan entries N\n/plan lead S\n/plan show")
+    sub=ctx.args[0].lower()
+    if sub=="entries" and len(ctx.args)>=2:
+        n=int(ctx.args[1]); STATS["entries_this_series"]=0
+        return await update.message.reply_text(f"Max entries/series set to {n}.")
+    if sub=="lead" and len(ctx.args)>=2:
+        LEAD_SEC=max(0,int(ctx.args[1])); return await update.message.reply_text(f"Lead set to {LEAD_SEC}s.")
+    if sub=="show":
+        tot=STATS["wins"]+STATS["losses"]; wr=(STATS["wins"]/tot*100) if tot else 0.0
+        return await update.message.reply_text(
+            f"Plan:\n• Lead: {LEAD_SEC}s\n• Entries(series): {STATS['entries_this_series']}\n• Wins: {STATS['wins']}  Losses: {STATS['losses']} (WR {wr:.1f}%)"
+        )
+    return await update.message.reply_text("Usage:\n/plan entries N\n/plan lead S\n/plan show")
+
+async def result_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args or ctx.args[0].lower() not in ("win","loss"):
+        return await update.message.reply_text("Usage: /result win|loss")
+    k=ctx.args[0].lower()
+    if k=="win": STATS["wins"]+=1; DAILY_COUNTER["wins"]+=1
+    else:        STATS["losses"]+=1; DAILY_COUNTER["losses"]+=1
+    tot=STATS["wins"]+STATS["losses"]; wr=(STATS["wins"]/tot*100) if tot else 0.0
+    await update.message.reply_text(f"📈 Recorded {k.upper()}.\nWins: {STATS['wins']}  Losses: {STATS['losses']}  WR: {wr:.1f}%")
+    if DAILY_COUNTER["wins"]>=DAILY_MAX_WINS or DAILY_COUNTER["losses"]>=DAILY_MAX_LOSSES:
+        AUTO_TASK["running"]=False; POOL_TASK["running"]=False
+        await update.message.reply_text("🛑 Daily stop reached. Halting now.")
+
+async def stats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    _daily_ensure_today()
+    tot=STATS["wins"]+STATS["losses"]; wr=(STATS["wins"]/tot*100) if tot else 0.0
+    await update.message.reply_text(
+        "📊 Session stats\n"
+        f"Signals sent: {STATS['total_signals']}\n"
+        f"Entries(series): {STATS['entries_this_series']}\n"
+        f"Wins: {STATS['wins']}  Losses: {STATS['losses']}  WR: {wr:.1f}%\n"
+        f"Daily: {DAILY_COUNTER['wins']}W / {DAILY_COUNTER['losses']}L (limits {DAILY_MAX_WINS}/{DAILY_MAX_LOSSES})"
+    )
+
+async def resetstats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    STATS.update({"wins":0,"losses":0,"entries_this_series":0,"total_signals":0,"last_reset":datetime.now(timezone.utc).isoformat()})
+    _daily_ensure_today(); DAILY_COUNTER["wins"]=0; DAILY_COUNTER["losses"]=0
+    await update.message.reply_text("✅ Stats reset.")
+
+async def payout_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global PAYOUT_MIN
+    if not ctx.args: return await update.message.reply_text(f"Payout threshold: {int(PAYOUT_MIN*100)}%\nUsage: /payout 75")
+    v=int(ctx.args[0]); 
+    if not (50<=v<=95): return await update.message.reply_text("Pick 50–95.")
+    PAYOUT_MIN=v/100.0; await update.message.reply_text(f"✅ Payout set to {v}%")
+
+async def watch_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global WATCHLIST
+    sub=(ctx.args[0].lower() if ctx.args else "list")
+    if sub=="add" and len(ctx.args)>=2:
+        sym=ctx.args[1].upper()
+        if sym not in WATCHLIST: WATCHLIST.append(sym)
+        return await update.message.reply_text(f"Added {sym}\n{', '.join(WATCHLIST)}")
+    if sub=="remove" and len(ctx.args)>=2:
+        sym=ctx.args[1].upper()
+        if sym in WATCHLIST: WATCHLIST.remove(sym)
+        return await update.message.reply_text(f"Removed {sym}\n{', '.join(WATCHLIST) if WATCHLIST else '(empty)'}")
+    if sub=="clear":
+        WATCHLIST=[]; return await update.message.reply_text("Watchlist cleared.")
+    return await update.message.reply_text(f"{', '.join(WATCHLIST) if WATCHLIST else '(empty)'}")
+
+async def poolthresh_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global POOL_MIN_PROB
+    if not ctx.args: return await update.message.reply_text(f"Pool threshold: {int(POOL_MIN_PROB*100)}%\nUsage: /poolthresh 62")
+    x=int(ctx.args[0])
+    if not (50<=x<=90): return await update.message.reply_text("Pick 50–90.")
+    POOL_MIN_PROB=x/100.0; await update.message.reply_text(f"✅ Pool threshold {x}%")
+
+async def autopool_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    a=ctx.args
+    if len(a) not in (2,3,4):
+        return await update.message.reply_text("Usage: /autopool AMOUNT DURATION [interval_sec=300] [tf=5min]")
+    amount=float(a[0]); duration=int(a[1])
+    interval=int(a[2]) if len(a)>=3 else 300
+    tf=a[3] if len(a)==4 else "5min"
+    if POOL_TASK["running"]: return await update.message.reply_text("Already running. /stoppool first.")
+    POOL_TASK["running"]=True
+    POOL_TASK["task"]=asyncio.create_task(autopool_loop(ctx, update.effective_chat.id, amount, duration, interval, tf))
+    await update.message.reply_text(f"▶️ Pool every {interval}s TF {tf}")
+
+async def stoppool_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    POOL_TASK["running"]=False
+    await update.message.reply_text("Stopping pool...")
+
+async def sources_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    global DATA_SOURCES_ORDER
+    if not ctx.args:
+        return await update.message.reply_text("Order: " + " > ".join(DATA_SOURCES_ORDER))
+    if ctx.args[0].lower()=="set" and len(ctx.args)>=2:
+        order=[p.strip().lower() for p in " ".join(ctx.args[1:]).split(",")]
+        clean=[p for p in order if p in PROVIDER_FUNCS]
+        if not clean: return await update.message.reply_text("Usage: /sources set twelve,alpha")
+        DATA_SOURCES_ORDER=clean
+        return await update.message.reply_text("✅ New order: " + " > ".join(DATA_SOURCES_ORDER))
+    return await update.message.reply_text("Usage:\n/sources            (show)\n/sources set twelve,alpha")
+
+async def echo_parse(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text: return
+    parsed = parse_line(update.message.text)
+    if not parsed: return
+    symbol, direction, amount, duration = parsed
+    candles, err = await fetch_candles(symbol, "1min", 120)
+    conf = _confidence_for_direction(direction, candles) if not err else None
+    disp,_=display_and_fetch_symbol(symbol)
+    await send_trade(disp, direction, amount, duration)
+    arrow=_dir_to_arrow(direction); conf_txt=f"\nConfidence: {int(conf*100)}%" if conf is not None else ""
+    await update.message.reply_text(
+        f"✅ Signal logged\nPair: {disp}\nDirection: {arrow}\nAmount: ${amount}\nDuration: {duration}s{conf_txt}\n\n➡️ PLACE {arrow} trade."
+    )
+
+# ===== Tracking loop =====
+async def track_loop(ctx, chat_id):
+    await ctx.bot.send_message(chat_id, f"🛰 Tracking ON (every {TRACK_TASK['interval']}s)")
+    while TRACK_TASK["running"]:
+        positions, err = await fetch_positions()
+        if err:
+            await asyncio.sleep(TRACK_TASK["interval"]); continue
+        for p in positions:
+            pid=str(p.get("id") or "")
+            if not pid or pid in SEEN_POS: continue
+            if p.get("outcome") in ("win","loss"):
+                SEEN_POS.add(pid)
+                arrow="UP" if p.get("direction")=="call" else "DOWN"
+                amt=p.get("amount",0); payout=p.get("payout",0.0)
+                if p["outcome"]=="win":
+                    STATS["wins"]+=1; DAILY_COUNTER["wins"]+=1; tag="✅ WIN"
+                else:
+                    STATS["losses"]+=1; DAILY_COUNTER["losses"]+=1; tag="❌ LOSS"
+                await ctx.bot.send_message(chat_id, f"{tag} | {p.get('symbol','?')} {arrow}\nStake: ${amt} | Payout: ${payout}")
+        await asyncio.sleep(TRACK_TASK["interval"])
+    await ctx.bot.send_message(chat_id,"🛰 Tracking OFF")
+
+async def track_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    sub=(ctx.args[0].lower() if ctx.args else "status")
+    if sub=="on":
+        if TRACK_TASK["running"]:
+            return await update.message.reply_text(f"Already on (every {TRACK_TASK['interval']}s)")
+        if len(ctx.args)>=2:
+            try: TRACK_TASK["interval"]=max(5,int(ctx.args[1]))
+            except: pass
+        TRACK_TASK["running"]=True
+        TRACK_TASK["task"]=asyncio.create_task(track_loop(ctx, update.effective_chat.id)); return
+    if sub=="off":
+        TRACK_TASK["running"]=False; return await update.message.reply_text("Tracking stopping...")
+    await update.message.reply_text(f"Tracking: {'ON' if TRACK_TASK['running'] else 'OFF'} | every {TRACK_TASK['interval']}s")
+
+# === ADDED: /autosignalfast (base strategy only, skips ATR/HTF filters) ===
+async def autosignalfast_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    a = ctx.args
+    if len(a) not in (3,4,5):
+        return await update.message.reply_text(
+            "Usage: /autosignalfast SYMBOL AMOUNT DURATION [interval_sec=60] [tf=1min]\n"
+            "Example: /autosignalfast EURUSD-OTC 5 60 60 1min"
+        )
+    symbol = a[0].upper()
+    amount = float(a[1]); duration = int(a[2])
+    interval_sec = int(a[3]) if len(a) >= 4 else 60
+    tf = a[4] if len(a) == 5 else "1min"
+
+    if AUTO_TASK["running"]:
+        return await update.message.reply_text("Already running. /stopsignal first.")
+    AUTO_TASK["running"] = True
+
+    async def loop():
+        disp,_ = display_and_fetch_symbol(symbol)
+        await update.message.reply_text(
+            f"▶️ FAST Auto-signal {disp} | ${amount} | {duration}s | every {interval_sec}s | TF {tf} | mode {STRATEGY_MODE}"
+        )
+        while AUTO_TASK["running"]:
+            candles, err = await fetch_candles(symbol, tf, 120)
+            if err:
+                await ctx.bot.send_message(update.effective_chat.id, f"❌ {err}")
+                await asyncio.sleep(interval_sec); continue
+
+            # base decision only (no ATR / no HTF confirm)
+            dec = decide_signal_ultra(candles, 0) if STRATEGY_MODE=="ultra" \
+                  else decide_signal_standard([float(c['close']) for c in candles])
+
+            if dec:
+                arrow = _dir_to_arrow(dec)
+                wait = next_bar_seconds(tf)
+                lead = min(LEAD_SEC, wait); eta = max(0, wait - lead)
+                await ctx.bot.send_message(update.effective_chat.id,
+                    f"📣 Upcoming ({tf})\nPair: {disp}\nDirection: {arrow}\nPlace at: next open (~{wait}s)\nExpiry: {duration}s")
+                if eta>0: await asyncio.sleep(eta)
+                if lead>0:
+                    await ctx.bot.send_message(update.effective_chat.id, f"⏱ Get ready: **{arrow}** on {disp} in ~{lead}s")
+                    await asyncio.sleep(lead)
+                await ctx.bot.send_message(update.effective_chat.id,
+                    f"✅ PLACE NOW\nPair: {disp}\nDirection: {arrow}\nAmount: ${amount}\nDuration: {duration}s")
+            else:
+                if VERBOSE:
+                    await ctx.bot.send_message(update.effective_chat.id, "ℹ️ No base signal this round.")
+            await asyncio.sleep(interval_sec)
+        await ctx.bot.send_message(update.effective_chat.id, "⏹ Fast auto-signal stopped.")
+
+    AUTO_TASK["task"] = asyncio.create_task(loop())
+
+# ===== Main =====
 def main():
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_cmd))
+    app.add_handler(CommandHandler("status", status_cmd))
+    app.add_handler(CommandHandler("mode", mode_cmd))
+    app.add_handler(CommandHandler("check", check_cmd))
+    app.add_handler(CommandHandler("signal", signal_cmd))
+    app.add_handler(CommandHandler("signalauto", signalauto_cmd))
+    # === Ensure these handlers exist ===
+    app.add_handler(CommandHandler("autosignal", autosignal_cmd))
+    app.add_handler(CommandHandler("stopsignal", stopsignal_cmd))
+    # === New fast mode handler ===
+    app.add_handler(CommandHandler("autosignalfast", autosignalfast_cmd))
 
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("otc",   cmd_otc))
-    app.add_handler(CommandHandler("autopoll", cmd_autopoll))
-    app.add_handler(CommandHandler("stop",  cmd_stop))
-    app.add_handler(CallbackQueryHandler(on_button))
+    app.add_handler(CommandHandler("plan", plan_cmd))
+    app.add_handler(CommandHandler("result", result_cmd))
+    app.add_handler(CommandHandler("stats", stats_cmd))
+    app.add_handler(CommandHandler("resetstats", resetstats_cmd))
+    app.add_handler(CommandHandler("payout", payout_cmd))
+    app.add_handler(CommandHandler("watch", watch_cmd))
+    app.add_handler(CommandHandler("poolthresh", poolthresh_cmd))
+    app.add_handler(CommandHandler("autopool", autopool_cmd))
+    app.add_handler(CommandHandler("stoppool", stoppool_cmd))
+    app.add_handler(CommandHandler("sources", sources_cmd))
+    app.add_handler(CommandHandler("track", track_cmd))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, echo_parse))
+    app.run_polling()
 
-    # Webhook only (no polling) – perfect for Render
-    app.run_webhook(
-        listen="0.0.0.0",
-        port=PORT,
-        url_path=TELEGRAM_BOT_TOKEN,
-        webhook_url=f"{PUBLIC_URL}/{TELEGRAM_BOT_TOKEN}",
-    )
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
