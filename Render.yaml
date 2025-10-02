@@ -4,4 +4,4 @@ services:
     env: python
     plan: starter
     buildCommand: pip install -r requirements.txt
-    startCommand: bot.py
+    startCommand: python telegram_bot.py
