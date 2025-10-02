@@ -856,7 +856,21 @@ async def track_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if sub=="off":
         TRACK_TASK["running"]=False; return await update.message.reply_text("Tracking stopping...")
     await update.message.reply_text(f"Tracking: {'ON' if TRACK_TASK['running'] else 'OFF'} | every {TRACK_TASK['interval']}s")
+# ... all your other command functions ...
 
+# === Autopool commands (missing handlers fix) ===
+async def autopool_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # code here...
+
+async def stoppool_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # code here...
+
+# ===== Main =====
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("autopool", autopool_cmd))
+    app.add_handler(CommandHandler("stoppool", stoppool_cmd))
+    # ... rest of handlers ...
 # ===== Main =====
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
