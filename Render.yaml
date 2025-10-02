@@ -6,6 +6,8 @@ services:
     startCommand: python bot.py
     envVars:
       - key: TELEGRAM_BOT_TOKEN
-        sync: false
+        value: 8471181182:AAEKGH1UASa5XvkXscb3jb5d1Yz19B8oJNM
       - key: TWELVE_API_KEY
-        sync: false
+        value: 9aa4ea677d00474aa0c3223d0c812425
+      - key: ALPHAVANTAGE_API_KEY
+        value: BM22MZEI0LL68RI6
