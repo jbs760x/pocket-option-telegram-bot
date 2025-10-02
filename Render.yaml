@@ -3,9 +3,6 @@ services:
     name: pocketoption-bot
     env: python
     plan: free
-    buildCommand: |
-      pip install --upgrade pip
-      pip install "python-telegram-bot>=21.0" "aiohttp>=3.9" "pandas>=2.0" "numpy>=1.24"
     startCommand: python bot.py
     envVars:
       - key: TELEGRAM_BOT_TOKEN
