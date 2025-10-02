@@ -8,45 +8,55 @@ from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, ContextTypes
 )
 
-# ===== LOGGING =====
+# ===================== LOGGING =====================
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     level=logging.INFO
 )
 log = logging.getLogger("otc-bot")
 
-# ===== YOUR KEYS =====
+# ===================== YOUR KEYS ===================
 TELEGRAM_BOT_TOKEN = "8471181182:AAEKGH1UASa5XvkXscb3jb5d1Yz19B8oJNM"
 TWELVE_API_KEY     = "9aa4ea677d00474aa0c3223d0c812425"
-ALPHA_VANTAGE_KEY  = "BM22MZEIOLL68RI6"  # fallback for non-OTC only
+ALPHA_VANTAGE_KEY  = "BM22MZEIOLL68RI6"   # non-OTC fallback only
 
-# ===== STRICT OTC SETTINGS / STATE =====
+# ============ STRICT OTC SETTINGS & STATE ==========
 STATE = {
+    # Focused OTC watchlist (you can change with /watchlist)
     "watchlist": ["EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC", "AUDUSD-OTC", "USDCHF-OTC"],
 
+    # run control
     "autopoll_running": False,
-    "duration_min": 60,          # how long /autopoll runs
+    "duration_min": 60,           # /autopoll session length
 
-    # API-thrifty pacing
-    "cooldown_min": 5,           # min per-pair gap (minutes)
-    "min_signal_gap_min": 7,     # min global gap (minutes)
+    # pacing (saves API + reduces noise)
+    "cooldown_min": 5,            # min per-pair gap (minutes)
+    "min_signal_gap_min": 7,      # min global gap (minutes)
 
     # strict confluence filters
-    "require_votes": 4,          # need 4/4: trend(EMA200), RSI50, MACD line>signal, EMA20>EMA50
-    "threshold": 0.80,           # min confidence 80%
-    "atr_floor": 0.0006,         # skip flat/choppy
+    # Need 4/4 to pass:
+    # 1) price above/below EMA200 (trend)
+    # 2) RSI(14) > 50 for BUY / < 50 for SELL
+    # 3) MACD line > signal (or <)
+    # 4) EMA20 > EMA50 (or <)
+    "require_votes": 4,
+    "threshold": 0.80,            # min confidence (80%)
+    "atr_floor": 0.0006,          # reject flat/chop
 
     # risk guard
     "loss_streak_limit": 3,
     "loss_streak": 0,
 
     # internals
-    "last_signal_time": None,
-    "pair_last_signal_time": {},
+    "last_signal_time": None,     # last global signal time
+    "pair_last_signal_time": {},  # last signal time per pair
     "chat_id": None,
+
+    # API-saver toggle via /economy
+    "economy": False,
 }
 
-# ---------- Helpers ----------
+# ================== SMALL HELPERS ==================
 def _now() -> datetime:
     return datetime.utcnow()
 
@@ -56,9 +66,12 @@ def _safe_float(x) -> Optional[float]:
     except Exception:
         return None
 
-# ---------- Data fetchers ----------
+# ================== DATA FETCHERS ==================
 def fetch_twelvedata(symbol: str, tf: str = "5min") -> Optional[List[dict]]:
-    """Primary source (works for many -OTC symbols). Returns last up-to-60 bars."""
+    """
+    Primary source. Returns up to last 60 bars as dicts:
+      {"t": datetime, "o": float, "h": float, "l": float, "c": float}
+    """
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": symbol, "interval": tf, "outputsize": 60,
@@ -69,7 +82,7 @@ def fetch_twelvedata(symbol: str, tf: str = "5min") -> Optional[List[dict]]:
         vals = j.get("values")
         if not vals:
             return None
-        items = []
+        out: List[dict] = []
         for v in vals:
             t = datetime.fromisoformat(v["datetime"])
             o = _safe_float(v.get("open"))
@@ -78,15 +91,17 @@ def fetch_twelvedata(symbol: str, tf: str = "5min") -> Optional[List[dict]]:
             c = _safe_float(v.get("close"))
             if None in (o, h, l, c):
                 continue
-            items.append({"t": t, "o": o, "h": h, "l": l, "c": c})
-        items.sort(key=lambda x: x["t"])
-        return items[-60:] if items else None
+            out.append({"t": t, "o": o, "h": h, "l": l, "c": c})
+        out.sort(key=lambda x: x["t"])
+        return out[-60:] if out else None
     except Exception as e:
-        log.warning("fetch_twelvedata error for %s: %s", symbol, e)
+        log.warning("TwelveData error for %s: %s", symbol, e)
         return None
 
 def fetch_alpha(symbol: str, tf: str = "5min") -> Optional[List[dict]]:
-    """Alpha Vantage fallback for non-OTC only."""
+    """
+    Alpha Vantage fallback for non-OTC pairs only.
+    """
     if "-OTC" in symbol:
         return None
     try:
@@ -103,27 +118,27 @@ def fetch_alpha(symbol: str, tf: str = "5min") -> Optional[List[dict]]:
         ts = j.get(key)
         if not ts:
             return None
-        items = []
-        for ts_k, v in ts.items():
-            t = datetime.fromisoformat(ts_k)
+        out: List[dict] = []
+        for ts_key, v in ts.items():
+            t = datetime.fromisoformat(ts_key)
             o = _safe_float(v.get("1. open"))
             h = _safe_float(v.get("2. high"))
             l = _safe_float(v.get("3. low"))
             c = _safe_float(v.get("4. close"))
             if None in (o, h, l, c):
                 continue
-            items.append({"t": t, "o": o, "h": h, "l": l, "c": c})
-        items.sort(key=lambda x: x["t"])
-        return items[-60:] if items else None
+            out.append({"t": t, "o": o, "h": h, "l": l, "c": c})
+        out.sort(key=lambda x: x["t"])
+        return out[-60:] if out else None
     except Exception as e:
-        log.warning("fetch_alpha error for %s: %s", symbol, e)
+        log.warning("AlphaVantage error for %s: %s", symbol, e)
         return None
 
 def fetch_ohlcv(symbol: str, tf: str = "5min") -> Optional[List[dict]]:
     d = fetch_twelvedata(symbol, tf)
     return d if d else fetch_alpha(symbol, tf)
 
-# ---------- Indicators ----------
+# ==================== INDICATORS ===================
 def ema_last(vals: List[float], n: int) -> Optional[float]:
     if len(vals) < n:
         return None
@@ -165,12 +180,15 @@ def macd_last(vals: List[float], fast: int = 12, slow: int = 26, signal: int = 9
         return (None, None)
     ef = _ema_series(vals, fast)
     es = _ema_series(vals, slow)
-    macd_line: List[Optional[float]] = [(ef[i] - es[i]) if (i < len(ef) and i < len(es) and ef[i] and es[i]) else None for i in range(len(vals))]
+    macd_line: List[Optional[float]] = [
+        (ef[i] - es[i]) if (i < len(ef) and i < len(es) and ef[i] and es[i]) else None
+        for i in range(len(vals))
+    ]
     macd_vals = [x for x in macd_line if x is not None]
     if len(macd_vals) < signal:
         return (None, None)
     sig_series = _ema_series(macd_vals, signal)
-    return macd_line[-1], sig_series[-1] if sig_series else (None, None)
+    return macd_line[-1], (sig_series[-1] if sig_series else None)
 
 def atr_last(highs: List[float], lows: List[float], closes: List[float], n: int = 14) -> Optional[float]:
     if len(closes) < n + 1:
@@ -188,8 +206,9 @@ def atr_last(highs: List[float], lows: List[float], closes: List[float], n: int 
         atr = (atr * (n - 1) + trs[i]) / n
     return atr
 
-# ---------- Strategy (strict OTC) ----------
+# ==================== STRATEGY =====================
 def analyze(symbol: str) -> Tuple[bool, Optional[str], float]:
+    """Return (ok, 'BUY'/'SELL', confidence) or (False, None, 0.0)."""
     bars = fetch_ohlcv(symbol, "5min")
     if not bars or len(bars) < 60:
         return (False, None, 0.0)
@@ -205,6 +224,7 @@ def analyze(symbol: str) -> Tuple[bool, Optional[str], float]:
     macd_line, macd_sig = macd_last(closes)
     atr14  = atr_last(highs, lows, closes, 14)
 
+    # Reject flat/chop
     if atr14 is None or atr14 < STATE["atr_floor"]:
         return (False, None, 0.0)
 
@@ -229,13 +249,14 @@ def analyze(symbol: str) -> Tuple[bool, Optional[str], float]:
     else:
         return (False, None, 0.0)
 
+    # map confluence votes → confidence (4/4 = 70%, +5% per extra, cap 95%)
     conf = max(0.0, min(0.95, 0.70 + 0.05 * (votes - 4)))
     if conf < STATE["threshold"]:
         return (False, None, conf)
 
     return (True, side, conf)
 
-# ---------- Messaging ----------
+# ==================== MESSAGING ====================
 async def send_signal(context: ContextTypes.DEFAULT_TYPE, pair: str, side: str, conf: float) -> None:
     kb = InlineKeyboardMarkup([[
         InlineKeyboardButton("✅ Win", callback_data="win"),
@@ -245,19 +266,23 @@ async def send_signal(context: ContextTypes.DEFAULT_TYPE, pair: str, side: str, 
     txt = f"📊 OTC Signal\nPair: {pair}\n👉 {side}\nConfidence: {int(conf*100)}%"
     await context.bot.send_message(chat_id=STATE["chat_id"], text=txt, reply_markup=kb)
 
-# ---------- Jobs ----------
+# ====================== JOBS =======================
 async def poll_job(context: ContextTypes.DEFAULT_TYPE):
     if not STATE["autopoll_running"] or STATE["chat_id"] is None:
         return
     now = _now()
 
+    # Economy mode (save API): widen pacing automatically
+    cooldown = STATE["cooldown_min"] if not STATE["economy"] else max(STATE["cooldown_min"], 15)
+    gap      = STATE["min_signal_gap_min"] if not STATE["economy"] else max(STATE["min_signal_gap_min"], 20)
+
     for pair in STATE["watchlist"]:
         # per-pair cooldown
         last_pair = STATE["pair_last_signal_time"].get(pair)
-        if last_pair and (now - last_pair).total_seconds() < STATE["cooldown_min"] * 60:
+        if last_pair and (now - last_pair).total_seconds() < cooldown * 60:
             continue
         # global gap
-        if STATE["last_signal_time"] and (now - STATE["last_signal_time"]).total_seconds() < STATE["min_signal_gap_min"] * 60:
+        if STATE["last_signal_time"] and (now - STATE["last_signal_time"]).total_seconds() < gap * 60:
             continue
 
         ok, side, conf = analyze(pair)
@@ -275,7 +300,7 @@ async def stop_job(context: ContextTypes.DEFAULT_TYPE):
     STATE["autopoll_running"] = False
     await context.bot.send_message(chat_id=STATE["chat_id"], text="⏹️ Autopoll duration ended.")
 
-# ---------- Buttons & Commands ----------
+# ============== BUTTONS & COMMANDS =================
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q:
@@ -299,10 +324,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "🤖 Strict OTC bot ready.\n"
         "Commands:\n"
-        "• /signal – scan now (one message per valid pair)\n"
+        "• /signal – scan now (silent if no signal)\n"
         "• /multisignal – bundle all valid pairs into ONE message\n"
         "• /watchlist EURUSD-OTC GBPUSD-OTC ... – set up to 5 pairs\n"
         "• /autopoll – auto every 5 min (stops after 3 losses)\n"
+        "• /economy – toggle API-saver mode ON/OFF\n"
         "• /stop – stop autopoll"
     )
 
@@ -360,8 +386,9 @@ async def cmd_autopoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     STATE["autopoll_running"] = True
     STATE["last_signal_time"] = None
     STATE["pair_last_signal_time"] = {}
-    context.job_queue.run_repeating(poll_job, interval=300, first=1, name="poll")  # every 5 min
-    context.job_queue.run_once(stop_job, when=STATE["duration_min"]*60, name="stopper")
+    # every 5 minutes; add stopper by duration
+    context.job_queue.run_repeating(poll_job, interval=300, first=1, name="poll")
+    context.job_queue.run_once(stop_job, when=STATE["duration_min"] * 60, name="stopper")
     await update.message.reply_text("▶️ Autopoll started. Waiting for high-quality signals…")
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -373,17 +400,28 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
             job.schedule_removal()
     await update.message.reply_text("⏹️ Autopoll stopped.")
 
-# ---------- Main ----------
+async def cmd_economy(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Toggle API-saver mode (widens cooldowns/gaps)."""
+    STATE["economy"] = not STATE["economy"]
+    if STATE["economy"]:
+        await update.message.reply_text("💡 Economy Mode ON – fewer API calls, stricter pacing.")
+    else:
+        await update.message.reply_text("⚡ Economy Mode OFF – back to normal pacing.")
+
+# ====================== MAIN =======================
 def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+
     app.add_handler(CommandHandler("start",       cmd_start))
     app.add_handler(CommandHandler("signal",      cmd_signal))
     app.add_handler(CommandHandler("multisignal", cmd_multisignal))
     app.add_handler(CommandHandler("watchlist",   cmd_watchlist))
     app.add_handler(CommandHandler("autopoll",    cmd_autopoll))
     app.add_handler(CommandHandler("stop",        cmd_stop))
+    app.add_handler(CommandHandler("economy",     cmd_economy))
     app.add_handler(CallbackQueryHandler(on_button))
-    log.info("Bot starting…")
+
+    log.info("Bot starting (v20 Application; no Updater)…")
     app.run_polling()
 
 if __name__ == "__main__":
