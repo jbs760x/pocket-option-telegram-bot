@@ -1,62 +1,74 @@
-import logging
-import requests
-from datetime import datetime
-from typing import Optional, List, Tuple
+# -*- coding: utf-8 -*-
+"""
+STRICT OTC TELEGRAM BOT (PTB v20+ ONLY)
+---------------------------------------
+Features:
+- OTC-focused watchlist (5 pairs default)
+- BUY/SELL with confidence %, strict filters (EMA200 trend + RSI(14) + MACD line>signal + EMA20>EMA50)
+- Inline Win/Loss/Skip tracking, auto-stop after 3 losses
+- /signal (silent if nothing qualifies)
+- /multisignal bundles all valid pairs into one message
+- /autopoll every 5 minutes with pacing guards to save API
+- /watchlist to set pairs (up to 5)
+- /economy toggle to reduce API usage (longer cooldowns/gaps)
+- No Updater anywhere (v20 Application only)
 
+Start command must be:  python bot.py
+"""
+
+import logging
+from typing import Optional, List, Tuple
+from datetime import datetime
+
+import requests
 from telegram import InlineKeyboardMarkup, InlineKeyboardButton, Update
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, ContextTypes
 )
 
-# ===================== LOGGING =====================
+# ------------------------ LOGGING ------------------------
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
     level=logging.INFO
 )
 log = logging.getLogger("otc-bot")
 
-# ===================== YOUR KEYS ===================
+# ---------------------- YOUR KEYS ------------------------
+# (you asked to embed them)
 TELEGRAM_BOT_TOKEN = "8471181182:AAEKGH1UASa5XvkXscb3jb5d1Yz19B8oJNM"
 TWELVE_API_KEY     = "9aa4ea677d00474aa0c3223d0c812425"
-ALPHA_VANTAGE_KEY  = "BM22MZEIOLL68RI6"   # non-OTC fallback only
+ALPHA_VANTAGE_KEY  = "BM22MZEIOLL68RI6"  # fallback for non-OTC only
 
-# ============ STRICT OTC SETTINGS & STATE ==========
+# -------------------- GLOBAL STATE -----------------------
 STATE = {
-    # Focused OTC watchlist (you can change with /watchlist)
     "watchlist": ["EURUSD-OTC", "GBPUSD-OTC", "USDJPY-OTC", "AUDUSD-OTC", "USDCHF-OTC"],
 
-    # run control
+    # autopoll & risk
     "autopoll_running": False,
-    "duration_min": 60,           # /autopoll session length
-
-    # pacing (saves API + reduces noise)
-    "cooldown_min": 5,            # min per-pair gap (minutes)
-    "min_signal_gap_min": 7,      # min global gap (minutes)
-
-    # strict confluence filters
-    # Need 4/4 to pass:
-    # 1) price above/below EMA200 (trend)
-    # 2) RSI(14) > 50 for BUY / < 50 for SELL
-    # 3) MACD line > signal (or <)
-    # 4) EMA20 > EMA50 (or <)
-    "require_votes": 4,
-    "threshold": 0.80,            # min confidence (80%)
-    "atr_floor": 0.0006,          # reject flat/chop
-
-    # risk guard
+    "duration_min": 60,
     "loss_streak_limit": 3,
     "loss_streak": 0,
 
-    # internals
-    "last_signal_time": None,     # last global signal time
-    "pair_last_signal_time": {},  # last signal time per pair
-    "chat_id": None,
+    # pacing (API thrift)
+    "cooldown_min": 5,           # per-pair minimum minutes between signals
+    "min_signal_gap_min": 7,     # global minimum minutes between any two signals
 
-    # API-saver toggle via /economy
+    # strategy strictness
+    "require_votes": 4,          # need 4/4 confluences
+    "threshold": 0.80,           # confidence threshold
+    "atr_floor": 0.0006,         # skip flat/choppy markets
+
+    # internals
+    "chat_id": None,
+    "pair_last_signal_time": {},
+    "last_signal_time": None,
+
+    # economy toggle (save API)
     "economy": False,
 }
 
-# ================== SMALL HELPERS ==================
+# =================== UTILS & DATA ===================
+
 def _now() -> datetime:
     return datetime.utcnow()
 
@@ -66,12 +78,8 @@ def _safe_float(x) -> Optional[float]:
     except Exception:
         return None
 
-# ================== DATA FETCHERS ==================
 def fetch_twelvedata(symbol: str, tf: str = "5min") -> Optional[List[dict]]:
-    """
-    Primary source. Returns up to last 60 bars as dicts:
-      {"t": datetime, "o": float, "h": float, "l": float, "c": float}
-    """
+    """Primary source (works for many -OTC symbols). Returns up to last 60 bars."""
     url = "https://api.twelvedata.com/time_series"
     params = {
         "symbol": symbol, "interval": tf, "outputsize": 60,
@@ -99,9 +107,7 @@ def fetch_twelvedata(symbol: str, tf: str = "5min") -> Optional[List[dict]]:
         return None
 
 def fetch_alpha(symbol: str, tf: str = "5min") -> Optional[List[dict]]:
-    """
-    Alpha Vantage fallback for non-OTC pairs only.
-    """
+    """Alpha Vantage fallback for non-OTC pairs only."""
     if "-OTC" in symbol:
         return None
     try:
@@ -114,8 +120,7 @@ def fetch_alpha(symbol: str, tf: str = "5min") -> Optional[List[dict]]:
             "outputsize": "compact"
         }
         j = requests.get(url, params=params, timeout=12).json()
-        key = "Time Series FX (5min)"
-        ts = j.get(key)
+        ts = j.get("Time Series FX (5min)")
         if not ts:
             return None
         out: List[dict] = []
@@ -138,7 +143,8 @@ def fetch_ohlcv(symbol: str, tf: str = "5min") -> Optional[List[dict]]:
     d = fetch_twelvedata(symbol, tf)
     return d if d else fetch_alpha(symbol, tf)
 
-# ==================== INDICATORS ===================
+# ===================== INDICATORS =====================
+
 def ema_last(vals: List[float], n: int) -> Optional[float]:
     if len(vals) < n:
         return None
@@ -206,9 +212,12 @@ def atr_last(highs: List[float], lows: List[float], closes: List[float], n: int 
         atr = (atr * (n - 1) + trs[i]) / n
     return atr
 
-# ==================== STRATEGY =====================
+# ====================== STRATEGY ======================
+
 def analyze(symbol: str) -> Tuple[bool, Optional[str], float]:
-    """Return (ok, 'BUY'/'SELL', confidence) or (False, None, 0.0)."""
+    """
+    Return (ok, 'BUY'/'SELL', confidence) or (False, None, 0.0) for silence.
+    """
     bars = fetch_ohlcv(symbol, "5min")
     if not bars or len(bars) < 60:
         return (False, None, 0.0)
@@ -224,19 +233,21 @@ def analyze(symbol: str) -> Tuple[bool, Optional[str], float]:
     macd_line, macd_sig = macd_last(closes)
     atr14  = atr_last(highs, lows, closes, 14)
 
-    # Reject flat/chop
     if atr14 is None or atr14 < STATE["atr_floor"]:
         return (False, None, 0.0)
 
     up = dn = 0
     up += 1 if closes[-1] > (ema200 or closes[-1]) else 0
     dn += 1 if closes[-1] < (ema200 or closes[-1]) else 0
+
     if rsi14 is not None:
         up += 1 if rsi14 > 50 else 0
         dn += 1 if rsi14 <= 50 else 0
+
     if macd_line is not None and macd_sig is not None:
         up += 1 if macd_line > macd_sig else 0
         dn += 1 if macd_line <= macd_sig else 0
+
     if ema20 is not None and ema50 is not None:
         up += 1 if ema20 > ema50 else 0
         dn += 1 if ema20 <= ema50 else 0
@@ -249,39 +260,41 @@ def analyze(symbol: str) -> Tuple[bool, Optional[str], float]:
     else:
         return (False, None, 0.0)
 
-    # map confluence votes → confidence (4/4 = 70%, +5% per extra, cap 95%)
+    # votes→confidence: 4/4=70%, +5% per extra, cap 95%
     conf = max(0.0, min(0.95, 0.70 + 0.05 * (votes - 4)))
     if conf < STATE["threshold"]:
         return (False, None, conf)
 
     return (True, side, conf)
 
-# ==================== MESSAGING ====================
+# ====================== MESSAGING ======================
+
 async def send_signal(context: ContextTypes.DEFAULT_TYPE, pair: str, side: str, conf: float) -> None:
     kb = InlineKeyboardMarkup([[
-        InlineKeyboardButton("✅ Win", callback_data="win"),
+        InlineKeyboardButton("✅ Win",  callback_data="win"),
         InlineKeyboardButton("❌ Loss", callback_data="loss"),
         InlineKeyboardButton("⏭ Skip", callback_data="skip"),
     ]])
     txt = f"📊 OTC Signal\nPair: {pair}\n👉 {side}\nConfidence: {int(conf*100)}%"
     await context.bot.send_message(chat_id=STATE["chat_id"], text=txt, reply_markup=kb)
 
-# ====================== JOBS =======================
+# ========================= JOBS =========================
+
 async def poll_job(context: ContextTypes.DEFAULT_TYPE):
+    """Repeating job: check pairs at interval and send signals if strict rules pass."""
     if not STATE["autopoll_running"] or STATE["chat_id"] is None:
         return
+
     now = _now()
 
-    # Economy mode (save API): widen pacing automatically
+    # Economy mode widens pacing to save API calls
     cooldown = STATE["cooldown_min"] if not STATE["economy"] else max(STATE["cooldown_min"], 15)
     gap      = STATE["min_signal_gap_min"] if not STATE["economy"] else max(STATE["min_signal_gap_min"], 20)
 
     for pair in STATE["watchlist"]:
-        # per-pair cooldown
         last_pair = STATE["pair_last_signal_time"].get(pair)
         if last_pair and (now - last_pair).total_seconds() < cooldown * 60:
             continue
-        # global gap
         if STATE["last_signal_time"] and (now - STATE["last_signal_time"]).total_seconds() < gap * 60:
             continue
 
@@ -294,13 +307,14 @@ async def poll_job(context: ContextTypes.DEFAULT_TYPE):
             await send_signal(context, pair, side, conf)
             STATE["pair_last_signal_time"][pair] = now
             STATE["last_signal_time"] = now
-        # else: silent on no-signal
+        # else: remain silent
 
 async def stop_job(context: ContextTypes.DEFAULT_TYPE):
     STATE["autopoll_running"] = False
     await context.bot.send_message(chat_id=STATE["chat_id"], text="⏹️ Autopoll duration ended.")
 
-# ============== BUTTONS & COMMANDS =================
+# =================== BUTTONS & COMMANDS ===================
+
 async def on_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     if not q:
@@ -347,7 +361,7 @@ async def cmd_signal(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"📊 OTC Signal\nPair: {pair}\n👉 {side}\nConfidence: {int(conf*100)}%",
                 reply_markup=kb
             )
-    # silent on no-signal
+    # silent if none
 
 async def cmd_multisignal(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message:
@@ -386,9 +400,11 @@ async def cmd_autopoll(update: Update, context: ContextTypes.DEFAULT_TYPE):
     STATE["autopoll_running"] = True
     STATE["last_signal_time"] = None
     STATE["pair_last_signal_time"] = {}
-    # every 5 minutes; add stopper by duration
+
+    # run every 5 minutes; stop after duration
     context.job_queue.run_repeating(poll_job, interval=300, first=1, name="poll")
     context.job_queue.run_once(stop_job, when=STATE["duration_min"] * 60, name="stopper")
+
     await update.message.reply_text("▶️ Autopoll started. Waiting for high-quality signals…")
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -401,14 +417,14 @@ async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏹️ Autopoll stopped.")
 
 async def cmd_economy(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Toggle API-saver mode (widens cooldowns/gaps)."""
     STATE["economy"] = not STATE["economy"]
     if STATE["economy"]:
         await update.message.reply_text("💡 Economy Mode ON – fewer API calls, stricter pacing.")
     else:
-        await update.message.reply_text("⚡ Economy Mode OFF – back to normal pacing.")
+        await update.message.reply_text("⚡ Economy Mode OFF – normal pacing.")
 
-# ====================== MAIN =======================
+# ========================= MAIN =========================
+
 def main():
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
@@ -421,7 +437,7 @@ def main():
     app.add_handler(CommandHandler("economy",     cmd_economy))
     app.add_handler(CallbackQueryHandler(on_button))
 
-    log.info("Bot starting (v20 Application; no Updater)…")
+    log.info("Bot starting (PTB v20 Application; no Updater)…")
     app.run_polling()
 
 if __name__ == "__main__":
