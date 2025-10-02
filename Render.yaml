@@ -1,0 +1,7 @@
+services:
+  - type: worker
+    name: po-bot
+    env: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: python telegram_bot.py
