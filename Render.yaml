@@ -1,7 +1,14 @@
 services:
   - type: worker
-    name: po-bot
+    name: pocketoption-bot
     env: python
-    plan: starter
-    buildCommand: pip install -r requirements.txt
-    startCommand: python telegram_bot.py
+    plan: free
+    buildCommand: |
+      pip install --upgrade pip
+      pip install "python-telegram-bot>=21.0" "aiohttp>=3.9" "pandas>=2.0" "numpy>=1.24"
+    startCommand: python bot.py
+    envVars:
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TWELVE_API_KEY
+        sync: false
