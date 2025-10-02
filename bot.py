@@ -871,6 +871,43 @@ def main():
     app.add_handler(CommandHandler("autopool", autopool_cmd))
     app.add_handler(CommandHandler("stoppool", stoppool_cmd))
     # ... rest of handlers ...
+    # === Autopool commands (missing handlers fix) ===
+async def autopool_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    """
+    Usage: /autopool AMOUNT DURATION [interval_sec=300] [tf=5min]
+    Example: /autopool 5 60 300 1min
+    Scans WATCHLIST every interval for best qualifying setup.
+    """
+    a = ctx.args
+    if len(a) not in (2, 3, 4):
+        return await update.message.reply_text(
+            "Usage: /autopool AMOUNT DURATION [interval_sec=300] [tf=5min]\n"
+            "Example: /autopool 5 60 300 1min"
+        )
+
+    try:
+        amount = float(a[0])
+        duration = int(a[1])
+        interval = int(a[2]) if len(a) >= 3 else 300
+        tf = a[3] if len(a) == 4 else "5min"
+    except Exception:
+        return await update.message.reply_text("Bad args. Example: /autopool 5 60 300 1min")
+
+    if POOL_TASK["running"]:
+        return await update.message.reply_text("Pool already running. Use /stoppool first.")
+
+    POOL_TASK["running"] = True
+    POOL_TASK["task"] = asyncio.create_task(
+        autopool_loop(ctx, update.effective_chat.id, amount, duration, interval, tf)
+    )
+    await update.message.reply_text(
+        f"▶️ Pool ON | stake ${amount} | {duration}s | every {interval}s | TF {tf} | watch {len(WATCHLIST)} pairs"
+    )
+
+
+async def stoppool_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    POOL_TASK["running"] = False
+    await update.message.reply_text("Stopping pool...")
 # ===== Main =====
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
