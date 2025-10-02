@@ -12,13 +12,12 @@ import pandas as pd
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
-# ================== YOUR KEYS / IDS ==================
-TELEGRAM_BOT_TOKEN   = "8471181182:AAEKGH1UASA5XvkXScb3jb5d1Yz19B8oJNM"
+# ======= YOUR SECRETS / OWNER (use these exact values) =======
+TELEGRAM_BOT_TOKEN   = "8471181182:AAGXwArVzZueU0GuvxDTMUSxYnn6ks_gjB0"
 TWELVE_API_KEY       = "9aa4ea677d00474aa0c3223d0c812425"
 ALPHAVANTAGE_API_KEY = "BM22MZEI0LL68RI6"
-OWNER_USER_ID        = 7814662315  # from userinfobot
-# =====================================================
-
+OWNER_USER_ID        = 7814662315
+# =============================================================
 # ---- Behavior ----
 DEFAULT_AUTOSIGNAL_SEC = 120          # autosignal cadence
 CACHE_TTL_SEC = 30                    # API cache to reduce burn
