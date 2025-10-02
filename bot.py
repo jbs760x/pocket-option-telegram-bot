@@ -10,10 +10,10 @@
 #
 # === Additions (kept all original features; only added) ===
 # * VERBOSE flag to announce skipped rounds (optional)
-# * /autosignal now open to anyone, supports [interval_sec] & [tf], defaults: 60s, 1min
+# * /autosignal open to anyone, supports [interval_sec] & [tf], defaults: 60s, 1min
 # * /stopsignal open to anyone
 # * /autosignalfast (optional) — base strategy only (no ATR/HTF), chattier
-# * Slight logging messages to confirm loop is running
+# * Inline overrides with your TOKEN/IDs/keys (no env needed)
 # ==========================================================
 
 import os, re, json, logging, asyncio, aiohttp, time
@@ -26,7 +26,7 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# ===== .env =====
+# ===== .env (defaults) =====
 BOT_TOKEN   = os.getenv("TELEGRAM_BOT_TOKEN") or os.getenv("BOT_TOKEN")
 ADMIN_ID    = int(os.getenv("ADMIN_CHAT_ID", "0"))
 WORKER_URL  = os.getenv("WORKER_URL", "http://127.0.0.1:8000")
@@ -35,8 +35,17 @@ TWELVE_KEY  = os.getenv("TWELVE_KEY") or os.getenv("TWELVE_API_KEY") or ""
 ALPHA_KEY   = os.getenv("ALPHAVANTAGE_KEY", "")
 DATA_SOURCES_ENV = os.getenv("DATA_SOURCES", "twelve,alpha")  # priority left→right
 
+# ===== Inline overrides (from you) =====
+# These override any .env values so you can just deploy & go.
+BOT_TOKEN        = "8471181182:AAEKGH1UASa5XvkXscb3jb5d1Yz19B8oJNM"
+ADMIN_ID         = 7814662315
+WORKER_URL       = ""  # empty => signal-only (no external trade worker)
+TWELVE_KEY       = "9aa4ea677d00474aa0c3223d0c812425"
+ALPHA_KEY        = "BM22MZEIOLL68RI6"
+DATA_SOURCES_ENV = "twelve,alpha"
+
 if not BOT_TOKEN:
-    raise SystemExit("Missing TELEGRAM_BOT_TOKEN (or BOT_TOKEN) in .env")
+    raise SystemExit("Missing TELEGRAM_BOT_TOKEN (or BOT_TOKEN)")
 
 # ===== Help =====
 HELP_TEXT = (
@@ -47,7 +56,7 @@ HELP_TEXT = (
     "/check SYMBOL [interval=5min]\n"
     "/signal SYMBOL call|put AMOUNT DURATION\n"
     "/signalauto SYMBOL AMOUNT DURATION [interval=5min]\n"
-    "/autosignal SYMBOL AMOUNT DURATION [interval_sec=300]\n"
+    "/autosignal SYMBOL AMOUNT DURATION [interval_sec=60] [tf=1min]\n"
     "/stopsignal\n\n"
     "📈 Stats & plan\n"
     "/plan entries N | lead S | show\n"
@@ -90,11 +99,13 @@ SEEN_POS = set()
 STRATEGY_MODE = "both"  # strict|active|mean|both|ultra
 _last_signal_bar_index = None
 
-# === ADDED: optional verbose announcements for skipped rounds ===
-VERBOSE = True  # set to False if you don't want "skipped" messages
+# Verbose skip messages
+VERBOSE = True
 
 # ===== Worker I/O =====
 async def ping_worker() -> bool:
+    if not WORKER_URL:
+        return False
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(f"{WORKER_URL}/health", timeout=5) as r:
@@ -103,6 +114,8 @@ async def ping_worker() -> bool:
         return False
 
 async def send_trade(symbol: str, direction: str, amount: float, duration: int):
+    if not WORKER_URL:
+        return {"status":"ok","note":"signal-only (no worker_url)"}
     payload = {"symbol":symbol.upper(),"direction":direction.lower(),"amount":float(amount),"duration_sec":int(duration)}
     try:
         async with aiohttp.ClientSession() as s:
@@ -113,6 +126,8 @@ async def send_trade(symbol: str, direction: str, amount: float, duration: int):
         return {"status":"error","error":str(e)}
 
 async def fetch_positions():
+    if not WORKER_URL:
+        return [], None
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(f"{WORKER_URL}/positions", timeout=10) as r:
@@ -129,7 +144,6 @@ def _dir_to_arrow(direction: str) -> str:
     return "UP" if direction.lower() == "call" else "DOWN"
 
 def parse_line(txt: str):
-    # "EURUSD-OTC call 2 60"
     m = re.match(r"^\s*([A-Za-z0-9/_\-.]+)\s+(call|put)\s+(\d+(?:\.\d+)?)\s+(\d+)\s*$", txt, re.I)
     if not m: return None
     s,d,a,dur = m.groups()
@@ -248,10 +262,7 @@ async def fetch_candles_alpha(symbol: str, interval="5min", limit=120):
     except Exception as e:
         return [], f"Alpha fetch failed: {e}"
 
-PROVIDER_FUNCS = {
-    "twelve": _fetch_candles_twelve,
-    "alpha":  fetch_candles_alpha,
-}
+PROVIDER_FUNCS = {"twelve": _fetch_candles_twelve, "alpha": fetch_candles_alpha}
 
 def parse_sources_env():
     order = [p.strip().lower() for p in DATA_SOURCES_ENV.split(",") if p.strip()]
@@ -407,13 +418,13 @@ async def autosignal_loop(ctx, chat_id, symbol, amount, duration, interval_sec, 
 
         conf = _confidence_for_direction(dec, candles) if dec else None
 
-        # ATR
+        # ATR filter
         if dec:
             atr=atr_from_candles(candles,14)
             if not atr or abs(float(candles[-1]["close"])-float(candles[-1]["open"])) < 0.6*atr:
                 dec=None
 
-        # HTF confirm
+        # 15m trend confirmation
         if dec:
             trend = await htf_trend_ok(symbol,"15min",120)
             if trend is not None:
@@ -421,8 +432,6 @@ async def autosignal_loop(ctx, chat_id, symbol, amount, duration, interval_sec, 
                 if (trend=="up" and not want_up) or (trend=="down" and want_up):
                     dec=None
 
-        if dec and PAYOUT_MIN>0.0:
-            pass
         if dec and not _cooldown_ok(disp):
             dec=None
 
@@ -437,13 +446,11 @@ async def autosignal_loop(ctx, chat_id, symbol, amount, duration, interval_sec, 
             if lead>0:
                 await ctx.bot.send_message(chat_id, f"⏱ Get ready: **{arrow}** on {disp} in ~{lead}s")
                 await asyncio.sleep(lead)
-
             await send_trade(disp, dec, amount, duration)
             STATS["entries_this_series"]+=1; STATS["total_signals"]+=1
             await ctx.bot.send_message(chat_id,
                 f"✅ PLACE NOW\nPair: {disp}\nDirection: {arrow}\nAmount: ${amount}\nDuration: {duration}s{conf_txt}")
         else:
-            # === ADDED: chatty skip so you know it’s alive ===
             if VERBOSE:
                 await ctx.bot.send_message(chat_id, "ℹ️ No valid setup this round (try /mode active or tf=1min).")
         await asyncio.sleep(interval_sec)
@@ -502,7 +509,6 @@ async def autopool_loop(ctx, chat_id, amount, duration, interval_sec, tf="5min")
                 await ctx.bot.send_message(chat_id,
                     f"✅ PLACE NOW\nPair: {disp}\nDirection: {arrow}\nAmount: ${amount}\nDuration: {duration}s\nConfidence: {int(p*100)}%")
         else:
-            # === ADDED: chattier when nothing qualifies ===
             if VERBOSE:
                 await ctx.bot.send_message(chat_id, f"🔄 Scanned {len(WATCHLIST)} pairs @ {tf} — none >= {int(POOL_MIN_PROB*100)}% (try /poolthresh 50 or /mode active)")
         await asyncio.sleep(interval_sec)
@@ -534,7 +540,7 @@ async def check_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     closes,err = await fetch_closes(symbol, interval, 120)
     if err: return await update.message.reply_text(f"❌ {err}")
     e=ema(closes,50); r=rsi(closes,14)
-    dec = decide_signal_ultra([{"open":closes[-2],"close":closes[-1],"high":max(closes[-2],closes[-1]),"low":min(closes[-2],closes[-1])}]*60) if STRATEGY_MODE=="ultra" else decide_signal_standard(closes)
+    dec = decide_signal_ultra([{"open":closes[-2],"close":closes[-1],"high":max(closes[-2],closes[-1]),"low":min(closes[-2],clses[-1])}]*60) if STRATEGY_MODE=="ultra" else decide_signal_standard(closes)
     await update.message.reply_text(
         f"📊 {disp} {interval}\nMode: {STRATEGY_MODE}\nCandles: {len(closes)}\nEMA50: {round(e,5) if e else 'n/a'}\nRSI14: {round(r,2) if r else 'n/a'}\nDecision: {dec or 'none'}"
     )
@@ -555,7 +561,7 @@ async def signal_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     arrow=_dir_to_arrow(direction)
     conf_txt=f"\nConfidence: {int(conf*100)}%" if conf is not None else ""
     await update.message.reply_text(
-        f"✅ Signal logged\nPair: {disp}\nDirection: {arrow}\nAmount: ${amount}\nDuration: {duration}s{conf_txt}\n\n➡️ PLACE {arrow} trade in Pocket Option."
+        f"✅ Signal logged\nPair: {disp}\nDirection: {arrow}\nAmount: ${amount}\nDuration: {duration}s{conf_txt}\n\n➡️ PLACE {arrow} trade."
     )
 
 async def signalauto_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -574,10 +580,10 @@ async def signalauto_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     arrow=_dir_to_arrow(decision)
     conf_txt=f"\nConfidence: {int(conf*100)}%" if conf is not None else ""
     await update.message.reply_text(
-        f"✅ Strategy signal\nPair: {disp}\nDirection: {arrow}\nAmount: ${amount}\nDuration: {duration}s{conf_txt}\n\n➡️ PLACE {arrow} trade in Pocket Option."
+        f"✅ Strategy signal\nPair: {disp}\nDirection: {arrow}\nAmount: ${amount}\nDuration: {duration}s{conf_txt}"
     )
 
-# === ADDED: /autosignal open to anyone, interval & TF supported, 1min defaults ===
+# === /autosignal (interval & TF supported, 1min defaults) ===
 async def autosignal_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     a = ctx.args
     if len(a) not in (3,4,5):
@@ -596,7 +602,7 @@ async def autosignal_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     AUTO_TASK["task"]=asyncio.create_task(autosignal_loop(ctx, update.effective_chat.id, symbol, amount, duration, interval_sec, tf))
     await update.message.reply_text(f"▶️ Auto-signal {symbol} | ${amount} | {duration}s | every {interval_sec}s | TF {tf} | mode {STRATEGY_MODE}")
 
-# === ADDED: /stopsignal open to anyone ===
+# === /stopsignal ===
 async def stopsignal_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     AUTO_TASK["running"]=False
     await update.message.reply_text("Stopping auto-signal...")
@@ -648,7 +654,7 @@ async def resetstats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def payout_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     global PAYOUT_MIN
     if not ctx.args: return await update.message.reply_text(f"Payout threshold: {int(PAYOUT_MIN*100)}%\nUsage: /payout 75")
-    v=int(ctx.args[0]); 
+    v=int(ctx.args[0])
     if not (50<=v<=95): return await update.message.reply_text("Pick 50–95.")
     PAYOUT_MIN=v/100.0; await update.message.reply_text(f"✅ Payout set to {v}%")
 
@@ -721,7 +727,7 @@ async def track_loop(ctx, chat_id):
     await ctx.bot.send_message(chat_id, f"🛰 Tracking ON (every {TRACK_TASK['interval']}s)")
     while TRACK_TASK["running"]:
         positions, err = await fetch_positions()
-        if err:
+        if err or positions is None:
             await asyncio.sleep(TRACK_TASK["interval"]); continue
         for p in positions:
             pid=str(p.get("id") or "")
@@ -752,7 +758,7 @@ async def track_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         TRACK_TASK["running"]=False; return await update.message.reply_text("Tracking stopping...")
     await update.message.reply_text(f"Tracking: {'ON' if TRACK_TASK['running'] else 'OFF'} | every {TRACK_TASK['interval']}s")
 
-# === ADDED: /autosignalfast (base strategy only, skips ATR/HTF filters) ===
+# === /autosignalfast (base strategy only, skips ATR/HTF filters) ===
 async def autosignalfast_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     a = ctx.args
     if len(a) not in (3,4,5):
@@ -814,12 +820,9 @@ def main():
     app.add_handler(CommandHandler("check", check_cmd))
     app.add_handler(CommandHandler("signal", signal_cmd))
     app.add_handler(CommandHandler("signalauto", signalauto_cmd))
-    # === Ensure these handlers exist ===
     app.add_handler(CommandHandler("autosignal", autosignal_cmd))
     app.add_handler(CommandHandler("stopsignal", stopsignal_cmd))
-    # === New fast mode handler ===
     app.add_handler(CommandHandler("autosignalfast", autosignalfast_cmd))
-
     app.add_handler(CommandHandler("plan", plan_cmd))
     app.add_handler(CommandHandler("result", result_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
