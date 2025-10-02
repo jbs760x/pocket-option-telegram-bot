@@ -1,6 +1,7 @@
 services:
   - type: worker
-    name: otc-sentinel-bot
+    name: po-bot
     env: python
-    plan: free
-    startCommand: python bot.py
+    plan: starter
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python bot.py"
