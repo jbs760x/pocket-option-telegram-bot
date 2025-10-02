@@ -1,3 +1,4 @@
 python-telegram-bot==13.15
 requests==2.32.3
 websocket-client==1.8.0
+imghdr-py==0.1.0
