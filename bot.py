@@ -863,7 +863,9 @@ async def autopool_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # code here...
 
 async def stoppool_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    # code here...
+    async def stoppool_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    POOL_TASK["running"] = False
+    await update.message.reply_text("Stopping pool...")
 
 # ===== Main =====
 def main():
