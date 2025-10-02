@@ -1,13 +1,6 @@
 services:
   - type: worker
-    name: pocketoption-bot
+    name: otc-sentinel-bot
     env: python
     plan: free
     startCommand: python bot.py
-    envVars:
-      - key: TELEGRAM_BOT_TOKEN
-        value: 8471181182:AAEKGH1UASa5XvkXscb3jb5d1Yz19B8oJNM
-      - key: TWELVE_API_KEY
-        value: 9aa4ea677d00474aa0c3223d0c812425
-      - key: ALPHAVANTAGE_API_KEY
-        value: BM22MZEI0LL68RI6
