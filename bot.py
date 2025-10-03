@@ -17,7 +17,8 @@ from telegram.ext import Application, CommandHandler, MessageHandler, filters, C
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
 # ===== Inline config (no .env needed on Render) =====
-BOT_TOKEN   = "8471181182:AAEKGH1UASa5XvkXscb3jb5d1Yz19B8oJNM"
+BOT_TOKEN   = "8471181182:AAGXwArVzZueU0GuvxDTMUSxYnn
+6ks_gjB0"
 ADMIN_ID    = 7814662315               # your Telegram user ID (admin)
 WORKER_URL  = ""                       # optional (e.g., "https://your-worker") for /track & /trade
 
