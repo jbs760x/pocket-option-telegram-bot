@@ -1,7 +1,8 @@
-python-telegram-bot==21.4
-aiohttp==3.9.5
-python-socketio
+pip>=25.2
+python-telegram-bot==20.8
 aiohttp
 requests
-python-telegram-bot==20.7
 pandas
+numpy
+twelve-data
+alpha-vantage
