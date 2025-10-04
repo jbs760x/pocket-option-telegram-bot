@@ -1,8 +1,6 @@
-pip>=25.2
-python-telegram-bot==20.8
 aiohttp
+python-telegram-bot==20.3
+pytz
 requests
-pandas
 numpy
-twelve-data
-alpha-vantage
+pandas
