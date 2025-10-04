@@ -1,3 +1,7 @@
 python-telegram-bot==21.4
 aiohttp==3.9.5
-git+https://github.com/lu-yi-hsun/pocketoptionapi.git
+python-socketio
+aiohttp
+requests
+python-telegram-bot==20.7
+pandas
