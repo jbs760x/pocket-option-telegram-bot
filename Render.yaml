@@ -4,11 +4,13 @@ services:
     env: python
     runtime: python
     plan: free
-    buildCommand: pip install --no-cache-dir -r requirements.txt
+    buildCommand: |
+      pip install --upgrade pip
+      pip install --no-cache-dir -r requirements.txt
     startCommand: python bot.py
     envVars:
       - key: PYTHON_VERSION
         value: 3.11.9
-      # OPTIONAL: set this if PO blocks Render IPs
+      # Optional if PO blocks your server IP:
       # - key: PO_PROXY_URL
       #   value: https://USER:PASS@proxy-host:port
