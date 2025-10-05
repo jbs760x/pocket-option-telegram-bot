@@ -11,3 +11,6 @@ services:
         value: d7a8a43d4618a7227c6ed769f8fd9975
       - key: DATA_SOURCES
         value: pocket,twelve,alpha
+env:
+  - key: PYTHON_VERSION
+    value: 3.10.13
