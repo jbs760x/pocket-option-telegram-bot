@@ -1,16 +1,7 @@
 services:
-  - type: web
-    name: pocket-option-telegram-bot
+  - type: worker
+    name: po-bot
     env: python
-    runtime: python
-    plan: free
-    buildCommand: |
-      pip install --upgrade pip
-      pip install --no-cache-dir -r requirements.txt
-    startCommand: python bot.py
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.9
-      # Optional if PO blocks your server IP:
-      # - key: PO_PROXY_URL
-      #   value: https://USER:PASS@proxy-host:port
+    plan: starter
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python bot.py
