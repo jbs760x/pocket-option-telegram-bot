@@ -1,8 +1,2 @@
-services:
-  - type: worker
-    name: pocket-option-telegram-bot
-    env: python
-    plan: free
-    numInstances: 1           # <— keep at 1
-    autoDeploy: false         # optional; avoids surprise redeploys
-    startCommand: "python bot.py"
+python-telegram-bot==21.4
+aiohttp==3.9.5
