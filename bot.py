@@ -1,14 +1,13 @@
-# === PocketOption OTC Telegram Bot (Signals Only) ===
+# === PocketOption OTC Telegram Bot (Signals Only, full features) ===
 # - TwelveData primary, AlphaVantage fallback
-# - Shows BUY/SELL + confidence %, but NEVER places trades
-# - /autosignal scans on a loop; /stopsignal stops it
-# - /result win|loss updates stats; bot stops after 3 losses (no win limit)
-# - Works with python-telegram-bot v20+ (no Updater errors)
+# - /mode, /check, /autosignal, /stopsignal, /result win|loss, /stats, /reset
+# - Confidence % from EMA50 + RSI14
+# - Stops after 3 losses (no win cap)
+# - Works with python-telegram-bot v20+ (Application, no Updater)
 
-import asyncio, logging, aiohttp, re
-from datetime import datetime, timezone, timedelta
+import asyncio, logging, aiohttp
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import Application, CommandHandler, ContextTypes, filters
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
@@ -18,15 +17,13 @@ ADMIN_ID   = 7814662315
 TWELVE_KEY = "9aa4ea677d00474aa0c3223d0c812425"
 ALPHA_KEY  = "BM22MZEIOLL68RI6"
 
-# === Bot settings ===
-DEFAULT_INTERVAL_SEC = 300      # autosignal loop every 5m
-DEFAULT_TF           = "5min"   # time frame for data
-LOSS_LIMIT           = 3        # stop after 3 losses
-WATCHLIST            = ["EURUSD-OTC","GBPUSD-OTC","USDJPY-OTC","AUDCAD-OTC"]
-
+# === Defaults ===
+DEFAULT_EVERY = 300      # seconds between autosignal scans
+DEFAULT_TF    = "5min"   # 1min/5min/15min/30min/60min (supported by providers)
+LOSS_LIMIT    = 3        # stop after 3 losses; no win limit
 STATE = {"auto": False, "task": None, "wins": 0, "losses": 0, "mode": "both"}
 
-HELP_TEXT = (
+HELP = (
     "🤖 Signals (manual only — I never place trades):\n"
     "/start, /help\n"
     "/mode strict|active|both|ultra\n"
@@ -34,14 +31,14 @@ HELP_TEXT = (
     "/autosignal SYMBOL AMOUNT DURATION [every=300] [tf=5min]\n"
     "/stopsignal\n\n"
     "📊 Stats & risk:\n"
-    "/result win|loss  (updates stats)\n"
-    "/stats, /reset\n\n"
+    "/result win|loss\n"
+    "/stats, /reset\n"
     "Examples:\n"
     "/check EURUSD-OTC 1min\n"
     "/autosignal EURUSD-OTC 5 60 300 1min\n"
 )
 
-# === TA helpers ===
+# ===== TA helpers =====
 def ema(v, p):
     if len(v) < p: return None
     k = 2/(p+1); e = sum(v[:p])/p
@@ -67,7 +64,6 @@ def decide(closes, mode="both"):
     last = closes[-1]
 
     def strict():
-        # cross + rsi swing out of OB/OS
         r_prev = rsi(closes[:-1],14)
         if r_prev is None: return None
         if last > e50 and r_prev < 30 <= r: return "call"
@@ -83,7 +79,6 @@ def decide(closes, mode="both"):
     if mode=="active": return active()
     if mode=="both":   return strict() or active()
     if mode=="ultra":
-        # momentum filter on top of both
         d = strict() or active()
         if not d: return None
         body = abs(closes[-1]-closes[-2])
@@ -101,7 +96,7 @@ def confidence_pct(closes):
     else: base = 55
     return max(50, min(80, int(base)))
 
-# === Symbol helpers ===
+# ===== Symbol helpers =====
 def td_symbol(sym: str) -> str:
     raw = sym.upper().replace("_","")
     raw = raw[:-4] if raw.endswith("-OTC") else raw
@@ -114,8 +109,8 @@ def alpha_from_to(sym: str):
     base = raw[:3]; quote = raw[3:6] if len(raw)>=6 else "USD"
     return base, quote
 
-# === Data fetch ===
-async def fetch_closes_twelve(symbol: str, interval="5min", limit=120):
+# ===== Data fetch =====
+async def fetch_closes_twelve(symbol: str, interval=DEFAULT_TF, limit=120):
     url = f"https://api.twelvedata.com/time_series?symbol={td_symbol(symbol)}&interval={interval}&outputsize={limit}&apikey={TWELVE_KEY}"
     try:
         async with aiohttp.ClientSession() as s:
@@ -126,13 +121,12 @@ async def fetch_closes_twelve(symbol: str, interval="5min", limit=120):
     except Exception:
         return []
 
-async def fetch_closes_alpha(symbol: str, interval="5min", limit=120):
+async def fetch_closes_alpha(symbol: str, interval=DEFAULT_TF, limit=120):
     base, quote = alpha_from_to(symbol)
-    if interval not in {"1min","5min","15min","30min","60min"}:
-        interval = "5min"
-    url = ( "https://www.alphavantage.co/query?"
-            f"function=FX_INTRADAY&from_symbol={base}&to_symbol={quote}"
-            f"&interval={interval}&apikey={ALPHA_KEY}&outputsize=compact")
+    if interval not in {"1min","5min","15min","30min","60min"}: interval = "5min"
+    url = ("https://www.alphavantage.co/query?"
+           f"function=FX_INTRADAY&from_symbol={base}&to_symbol={quote}"
+           f"&interval={interval}&apikey={ALPHA_KEY}&outputsize=compact")
     try:
         async with aiohttp.ClientSession() as s:
             async with s.get(url, timeout=20) as r:
@@ -144,17 +138,17 @@ async def fetch_closes_alpha(symbol: str, interval="5min", limit=120):
     except Exception:
         return []
 
-async def fetch_closes(symbol, interval="5min", limit=120):
+async def fetch_closes(symbol, interval=DEFAULT_TF, limit=120):
     data = await fetch_closes_twelve(symbol, interval, limit)
     if data: return data
     return await fetch_closes_alpha(symbol, interval, limit)
 
-# === Commands ===
+# ===== Commands =====
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Bot online (signals only).\n" + HELP_TEXT)
+    await update.message.reply_text("✅ Bot online (signals only).\n" + HELP)
 
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_TEXT)
+    await update.message.reply_text(HELP)
 
 async def mode_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not ctx.args or ctx.args[0].lower() not in ("strict","active","both","ultra"):
@@ -186,7 +180,7 @@ async def autosignal_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         )
     symbol = ctx.args[0].upper()
     amount = float(ctx.args[1]); duration = int(ctx.args[2])
-    every = int(ctx.args[3]) if len(ctx.args)>=4 else DEFAULT_INTERVAL_SEC
+    every = int(ctx.args[3]) if len(ctx.args)>=4 else DEFAULT_EVERY
     tf = ctx.args[4] if len(ctx.args)==5 else DEFAULT_TF
 
     STATE["auto"] = True
@@ -236,7 +230,7 @@ async def reset_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE.update({"wins":0,"losses":0})
     await update.message.reply_text("✅ Stats reset.")
 
-# === Main ===
+# ===== Main =====
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
