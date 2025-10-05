@@ -1,9 +1,7 @@
-services:
+lservices:
   - type: web
     name: pocket-option-telegram-bot
     env: python
     plan: free
-    buildCommand: ""
-    startCommand: "python bot.py"
-    autoDeploy: false
-    envVars: []
+    buildCommand: pip install -r requirements.txt
+    startCommand: python bot.py
