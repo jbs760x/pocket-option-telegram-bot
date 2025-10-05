@@ -5,14 +5,3 @@ services:
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
-    envVars:
-      - key: PYTHON_VERSION
-        value: 3.11.9
-      - key: BOT_TOKEN
-        value: 8471181182:AAFEhPc59AvzNsnuPbj-N2PatGbvgZnnd_0
-      - key: ADMIN_ID
-        value: "7814662315"
-      - key: ALPHA_KEY
-        value: BM22MZEIOLL68RI6
-      - key: TWELVE_KEY
-        value: 9aa4ea677d00474aa0c3223d0c812425
