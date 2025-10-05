@@ -1,7 +1,10 @@
-lservices:
-  - type: web
-    name: pocket-option-telegram-bot
-    env: python
-    plan: free
-    buildCommand: pip install -r requirements.txt
-    startCommand: python bot.py
+services:
+- type: worker
+  name: pocket-option-telegram-bot
+  env: python
+  plan: free
+  pythonVersion: 3.13.0
+  buildCommand: |
+    pip install --upgrade pip
+    pip install --no-cache-dir -r requirements.txt
+  startCommand: python bot.py
