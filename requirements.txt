@@ -1,4 +1,6 @@
-python-telegram-bot==20.7
+python-telegram-bot==20.8
 aiohttp==3.9.5
 requests==2.31.0
+python-socketio[asyncio_client]==5.11.4
 pytz
+numpy
