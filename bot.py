@@ -1,44 +1,45 @@
-# === PocketOption OTC Telegram Bot (Signals Only, full features) ===
+# === PocketOption OTC Telegram Bot (signals-only, webhook) ===
 # - TwelveData primary, AlphaVantage fallback
 # - /mode, /check, /autosignal, /stopsignal, /result win|loss, /stats, /reset
-# - Confidence % from EMA50 + RSI14
-# - Stops after 3 losses (no win cap)
-# - Works with python-telegram-bot v20+ (Application, no Updater)
+# - Confidence % from EMA50 + RSI14 (+ momentum in "ultra")
+# - Stops after 3 losses; NO win limit
+# - Webhook mode (works on Render; no Updater/polling)
 
-import asyncio, logging, aiohttp
+import os, asyncio, logging, aiohttp
 from telegram import Update
-from telegram.ext import Application, CommandHandler, ContextTypes, filters
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# === Your credentials ===
-BOT_TOKEN  = "8471181182:AAFEhPc59AvzNsnuPbj-N2PatGbvgZnnd_0"
-ADMIN_ID   = 7814662315
-TWELVE_KEY = "9aa4ea677d00474aa0c3223d0c812425"
-ALPHA_KEY  = "BM22MZEIOLL68RI6"
+# ==== CONFIG (filled with your values) ====
+BOT_TOKEN  = os.getenv("BOT_TOKEN",  "8471181182:AAFEhPc59AvzNsnuPbj-N2PatGbvgZnnd_0")
+ADMIN_ID   = int(os.getenv("ADMIN_ID", "7814662315"))
+TWELVE_KEY = os.getenv("TWELVE_KEY",  "9aa4ea677d00474aa0c3223d0c812425")
+ALPHA_KEY  = os.getenv("ALPHA_KEY",   "BM22MZEIOLL68RI6")
 
-# === Defaults ===
-DEFAULT_EVERY = 300      # seconds between autosignal scans
-DEFAULT_TF    = "5min"   # 1min/5min/15min/30min/60min (supported by providers)
-LOSS_LIMIT    = 3        # stop after 3 losses; no win limit
+# Render provides these:
+PORT = int(os.getenv("PORT", "10000"))
+PUBLIC_URL = os.getenv("RENDER_EXTERNAL_URL", "").rstrip("/")
+
+DEFAULT_EVERY = 300
+DEFAULT_TF = "5min"
+LOSS_LIMIT = 3
+
 STATE = {"auto": False, "task": None, "wins": 0, "losses": 0, "mode": "both"}
 
 HELP = (
-    "🤖 Signals (manual only — I never place trades):\n"
+    "🤖 Signals (manual only — I never place trades)\n"
     "/start, /help\n"
     "/mode strict|active|both|ultra\n"
     "/check SYMBOL [tf=5min]\n"
     "/autosignal SYMBOL AMOUNT DURATION [every=300] [tf=5min]\n"
     "/stopsignal\n\n"
-    "📊 Stats & risk:\n"
+    "📊 Stats\n"
     "/result win|loss\n"
     "/stats, /reset\n"
-    "Examples:\n"
-    "/check EURUSD-OTC 1min\n"
-    "/autosignal EURUSD-OTC 5 60 300 1min\n"
 )
 
-# ===== TA helpers =====
+# ===== TA =====
 def ema(v, p):
     if len(v) < p: return None
     k = 2/(p+1); e = sum(v[:p])/p
@@ -64,10 +65,10 @@ def decide(closes, mode="both"):
     last = closes[-1]
 
     def strict():
-        r_prev = rsi(closes[:-1],14)
-        if r_prev is None: return None
-        if last > e50 and r_prev < 30 <= r: return "call"
-        if last < e50 and r_prev > 70 >= r: return "put"
+        rp = rsi(closes[:-1],14)
+        if rp is None: return None
+        if last > e50 and rp < 30 <= r: return "call"
+        if last < e50 and rp > 70 >= r: return "put"
         return None
 
     def active():
@@ -96,7 +97,7 @@ def confidence_pct(closes):
     else: base = 55
     return max(50, min(80, int(base)))
 
-# ===== Symbol helpers =====
+# ===== symbols =====
 def td_symbol(sym: str) -> str:
     raw = sym.upper().replace("_","")
     raw = raw[:-4] if raw.endswith("-OTC") else raw
@@ -106,11 +107,11 @@ def td_symbol(sym: str) -> str:
 def alpha_from_to(sym: str):
     raw = sym.upper().replace("/","")
     raw = raw[:-4] if raw.endswith("-OTC") else raw
-    base = raw[:3]; quote = raw[3:6] if len(raw)>=6 else "USD"
-    return base, quote
+    return raw[:3], (raw[3:6] if len(raw)>=6 else "USD")
 
-# ===== Data fetch =====
-async def fetch_closes_twelve(symbol: str, interval=DEFAULT_TF, limit=120):
+# ===== data =====
+async def fetch_closes_twelve(symbol, interval=DEFAULT_TF, limit=120):
+    if not TWELVE_KEY: return []
     url = f"https://api.twelvedata.com/time_series?symbol={td_symbol(symbol)}&interval={interval}&outputsize={limit}&apikey={TWELVE_KEY}"
     try:
         async with aiohttp.ClientSession() as s:
@@ -121,7 +122,8 @@ async def fetch_closes_twelve(symbol: str, interval=DEFAULT_TF, limit=120):
     except Exception:
         return []
 
-async def fetch_closes_alpha(symbol: str, interval=DEFAULT_TF, limit=120):
+async def fetch_closes_alpha(symbol, interval=DEFAULT_TF, limit=120):
+    if not ALPHA_KEY: return []
     base, quote = alpha_from_to(symbol)
     if interval not in {"1min","5min","15min","30min","60min"}: interval = "5min"
     url = ("https://www.alphavantage.co/query?"
@@ -131,7 +133,7 @@ async def fetch_closes_alpha(symbol: str, interval=DEFAULT_TF, limit=120):
         async with aiohttp.ClientSession() as s:
             async with s.get(url, timeout=20) as r:
                 js = await r.json()
-                ts = next((v for k,v in js.items() if "Time Series" in k), None)
+                ts = next((v for k,v in js.items() if 'Time Series' in k), None)
                 if not ts: return []
                 items = sorted(ts.items())[-limit:]
                 return [float(v["4. close"]) for _,v in items]
@@ -143,7 +145,7 @@ async def fetch_closes(symbol, interval=DEFAULT_TF, limit=120):
     if data: return data
     return await fetch_closes_alpha(symbol, interval, limit)
 
-# ===== Commands =====
+# ===== commands =====
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Bot online (signals only).\n" + HELP)
 
@@ -159,26 +161,24 @@ async def mode_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 async def check_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if len(ctx.args) not in (1,2):
         return await update.message.reply_text("Usage: /check SYMBOL [tf=5min]")
-    symbol = ctx.args[0].upper()
+    sym = ctx.args[0].upper()
     tf = ctx.args[1] if len(ctx.args)==2 else DEFAULT_TF
-    closes = await fetch_closes(symbol, tf, 120)
+    closes = await fetch_closes(sym, tf, 120)
     if not closes:
         return await update.message.reply_text("❌ No data right now.")
-    decision = decide(closes, STATE["mode"]) or "none"
+    dec = (decide(closes, STATE["mode"]) or "none").upper()
     conf = confidence_pct(closes)
-    await update.message.reply_text(
-        f"📊 {symbol} {tf}\nMode: {STATE['mode']}\nCandles: {len(closes)}\nDecision: {decision.upper()}\nConfidence: {conf}%\n\n(Manual entry only)"
-    )
+    await update.message.reply_text(f"📊 {sym} {tf}\nMode: {STATE['mode']}\nDecision: {dec}\nConfidence: {conf}%\n\n➡️ Manual entry only")
 
 async def autosignal_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if STATE["auto"]:
-        return await update.message.reply_text("Already running. Use /stopsignal first.")
+        return await update.message.reply_text("Already running. /stopsignal first.")
     if len(ctx.args) not in (3,4,5):
         return await update.message.reply_text(
             "Usage: /autosignal SYMBOL AMOUNT DURATION [every=300] [tf=5min]\n"
             "Example: /autosignal EURUSD-OTC 5 60 300 1min"
         )
-    symbol = ctx.args[0].upper()
+    sym = ctx.args[0].upper()
     amount = float(ctx.args[1]); duration = int(ctx.args[2])
     every = int(ctx.args[3]) if len(ctx.args)>=4 else DEFAULT_EVERY
     tf = ctx.args[4] if len(ctx.args)==5 else DEFAULT_TF
@@ -186,20 +186,20 @@ async def autosignal_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE["auto"] = True
 
     async def loop(chat_id):
-        await ctx.bot.send_message(chat_id, f"▶️ Auto-signal {symbol} | ${amount} | {duration}s | every {every}s | TF {tf} | mode {STATE['mode']}")
+        await ctx.bot.send_message(chat_id,
+            f"▶️ Auto-signal {sym} | ${amount} | {duration}s | every {every}s | TF {tf} | mode {STATE['mode']}")
         while STATE["auto"] and STATE["losses"] < LOSS_LIMIT:
-            closes = await fetch_closes(symbol, tf, 120)
+            closes = await fetch_closes(sym, tf, 120)
             if closes:
                 dec = decide(closes, STATE["mode"])
                 if dec:
                     conf = confidence_pct(closes)
                     arrow = "UP" if dec=="call" else "DOWN"
                     await ctx.bot.send_message(chat_id,
-                        f"📣 SIGNAL\nPair: {symbol}\nDirection: {arrow}\nAmount: ${amount}\nDuration: {duration}s\nConfidence: {conf}%\n\n➡️ Manually place the trade.")
+                        f"📣 SIGNAL\nPair: {sym}\nDirection: {arrow}\nAmount: ${amount}\nDuration: {duration}s\nConfidence: {conf}%\n\n➡️ Place manually")
             await asyncio.sleep(every)
         STATE["auto"] = False
         await ctx.bot.send_message(chat_id, "⏹ Auto-signal stopped.")
-
     STATE["task"] = asyncio.create_task(loop(update.effective_chat.id))
     await update.message.reply_text("Auto started.")
 
@@ -221,7 +221,7 @@ async def result_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def stats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     tot = STATE["wins"] + STATE["losses"]
-    wr  = (STATE["wins"]/tot*100) if tot else 0.0
+    wr = (STATE["wins"]/tot*100) if tot else 0.0
     await update.message.reply_text(
         f"📈 Stats\nWins: {STATE['wins']}  Losses: {STATE['losses']}  WR: {wr:.1f}%\nLoss limit: {LOSS_LIMIT}"
     )
@@ -230,9 +230,15 @@ async def reset_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     STATE.update({"wins":0,"losses":0})
     await update.message.reply_text("✅ Stats reset.")
 
-# ===== Main =====
+# ===== main (WEBHOOK) =====
+async def post_init(app: Application):
+    if not PUBLIC_URL:
+        logging.warning("RENDER_EXTERNAL_URL missing — running local webhook.")
+        return
+    await app.bot.set_webhook(url=f"{PUBLIC_URL}/{BOT_TOKEN}")
+
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
     app.add_handler(CommandHandler("mode", mode_cmd))
@@ -242,7 +248,14 @@ def main():
     app.add_handler(CommandHandler("result", result_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("reset", reset_cmd))
-    app.run_polling()
+
+    # Run webhook server (no Updater/polling involved)
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=BOT_TOKEN,
+        webhook_url=f"{PUBLIC_URL}/{BOT_TOKEN}" if PUBLIC_URL else None,
+    )
 
 if __name__ == "__main__":
     main()
