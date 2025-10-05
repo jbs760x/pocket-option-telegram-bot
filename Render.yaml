@@ -1,9 +1,7 @@
 services:
   - type: worker
-    name: pocket-option-telegram-bot
+    name: pocket-option-signal-bot
     env: python
-    region: oregon
     plan: free
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
-    autoDeploy: true
