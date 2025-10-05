@@ -1,150 +1,254 @@
-# === TELEGRAM OTC BOT (AUTO SIGNAL + POOL + TRACK) ===
-# Plug and play for Render (no .env needed)
-# Stops after 3 losses — no win limit
+# === PocketOption OTC Telegram Bot (Signals Only) ===
+# - TwelveData primary, AlphaVantage fallback
+# - Shows BUY/SELL + confidence %, but NEVER places trades
+# - /autosignal scans on a loop; /stopsignal stops it
+# - /result win|loss updates stats; bot stops after 3 losses (no win limit)
+# - Works with python-telegram-bot v20+ (no Updater errors)
 
-import logging, asyncio, aiohttp, time, re
+import asyncio, logging, aiohttp, re
 from datetime import datetime, timezone, timedelta
-from collections import deque
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-# ======= CONFIG =======
-BOT_TOKEN = "8471181182:AAFEhPc59AvzNsnuPbj-N2PatGbvgZnnd_0"
-ADMIN_ID = 7814662315
-
+# === Your credentials ===
+BOT_TOKEN  = "8471181182:AAFEhPc59AvzNsnuPbj-N2PatGbvgZnnd_0"
+ADMIN_ID   = 7814662315
 TWELVE_KEY = "9aa4ea677d00474aa0c3223d0c812425"
-ALPHA_KEY = "BM22MZEIOLL68RI6"
+ALPHA_KEY  = "BM22MZEIOLL68RI6"
 
-# ======= GLOBAL STATE =======
-STATS = {"wins": 0, "losses": 0}
-DAILY_LIMIT_LOSSES = 3
-AUTO_RUNNING = False
-POOL_RUNNING = False
+# === Bot settings ===
+DEFAULT_INTERVAL_SEC = 300      # autosignal loop every 5m
+DEFAULT_TF           = "5min"   # time frame for data
+LOSS_LIMIT           = 3        # stop after 3 losses
+WATCHLIST            = ["EURUSD-OTC","GBPUSD-OTC","USDJPY-OTC","AUDCAD-OTC"]
 
-# ======= HELP =======
-HELP_MSG = (
-    "📈 Commands:\n"
-    "/start — Ready check\n"
-    "/mode strict|active|ultra\n"
-    "/autosignal SYMBOL AMOUNT DURATION\n"
-    "/stopsignal — stop autosignal\n"
-    "/autopool AMOUNT DURATION\n"
-    "/stoppool — stop pool\n"
-    "/result win|loss — record result\n"
-    "/stats — show stats\n"
-    "/reset — reset stats"
+STATE = {"auto": False, "task": None, "wins": 0, "losses": 0, "mode": "both"}
+
+HELP_TEXT = (
+    "🤖 Signals (manual only — I never place trades):\n"
+    "/start, /help\n"
+    "/mode strict|active|both|ultra\n"
+    "/check SYMBOL [tf=5min]\n"
+    "/autosignal SYMBOL AMOUNT DURATION [every=300] [tf=5min]\n"
+    "/stopsignal\n\n"
+    "📊 Stats & risk:\n"
+    "/result win|loss  (updates stats)\n"
+    "/stats, /reset\n\n"
+    "Examples:\n"
+    "/check EURUSD-OTC 1min\n"
+    "/autosignal EURUSD-OTC 5 60 300 1min\n"
 )
 
-# ======= SIMPLE EMA & RSI =======
-def ema(values, period):
-    if len(values) < period: return None
-    k = 2/(period+1)
-    ev = sum(values[:period])/period
-    for v in values[period:]: ev = v*k + ev*(1-k)
-    return ev
+# === TA helpers ===
+def ema(v, p):
+    if len(v) < p: return None
+    k = 2/(p+1); e = sum(v[:p])/p
+    for x in v[p:]: e = x*k + e*(1-k)
+    return e
 
-def rsi(values, period=14):
-    if len(values) <= period: return None
-    gains = [max(values[i]-values[i-1],0) for i in range(1,len(values))]
-    losses = [max(values[i-1]-values[i],0) for i in range(1,len(values))]
-    avg_g, avg_l = sum(gains[:period])/period, sum(losses[:period])/period
-    for i in range(period,len(values)-1):
-        avg_g = (avg_g*(period-1)+gains[i])/period
-        avg_l = (avg_l*(period-1)+losses[i])/period
-    if avg_l==0: return 100
-    rs = avg_g/avg_l
-    return 100 - (100/(1+rs))
+def rsi(v, p=14):
+    if len(v) <= p: return None
+    gains = [max(v[i]-v[i-1],0) for i in range(1,len(v))]
+    losses= [max(v[i-1]-v[i],0) for i in range(1,len(v))]
+    ag, al = sum(gains[:p])/p, sum(losses[:p])/p
+    for i in range(p,len(v)-1):
+        ag = (ag*(p-1)+gains[i])/p
+        al = (al*(p-1)+losses[i])/p
+    if al == 0: return 100.0
+    rs = ag/al
+    return 100 - 100/(1+rs)
 
-# ======= FETCH DATA =======
-async def fetch_closes(symbol, key, source="twelve"):
-    url = ""
-    if source=="twelve":
-        url = f"https://api.twelvedata.com/time_series?symbol={symbol}&interval=5min&apikey={key}"
-    else:
-        base, quote = symbol[:3], symbol[3:]
-        url = f"https://www.alphavantage.co/query?function=FX_INTRADAY&from_symbol={base}&to_symbol={quote}&interval=5min&apikey={key}"
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(url, timeout=10) as r:
-                js = await r.json()
-                if source=="twelve": vals = js.get("values", [])
-                else:
-                    ts = next((v for k,v in js.items() if "Time Series" in k), None)
-                    vals = [{"close": float(v["4. close"])} for v in ts.values()] if ts else []
-                return [float(v["close"]) for v in vals][::-1]
-    except:
-        return []
+def decide(closes, mode="both"):
+    if len(closes) < 60: return None
+    e50 = ema(closes,50); r = rsi(closes,14)
+    if e50 is None or r is None: return None
+    last = closes[-1]
 
-# ======= SIGNAL DECISION =======
-def decide(closes):
-    e50 = ema(closes, 50)
-    r = rsi(closes, 14)
-    if not e50 or not r: return None
-    if r <= 30 and closes[-1] > e50: return "call"
-    if r >= 70 and closes[-1] < e50: return "put"
+    def strict():
+        # cross + rsi swing out of OB/OS
+        r_prev = rsi(closes[:-1],14)
+        if r_prev is None: return None
+        if last > e50 and r_prev < 30 <= r: return "call"
+        if last < e50 and r_prev > 70 >= r: return "put"
+        return None
+
+    def active():
+        if last > e50 and r > 55: return "call"
+        if last < e50 and r < 45: return "put"
+        return None
+
+    if mode=="strict": return strict()
+    if mode=="active": return active()
+    if mode=="both":   return strict() or active()
+    if mode=="ultra":
+        # momentum filter on top of both
+        d = strict() or active()
+        if not d: return None
+        body = abs(closes[-1]-closes[-2])
+        avg  = sum(abs(closes[i]-closes[i-1]) for i in range(-11,-1))/10
+        return d if body >= avg else None
     return None
 
-# ======= COMMANDS =======
+def confidence_pct(closes):
+    if len(closes) < 60: return 55
+    e50 = ema(closes,50); r = rsi(closes,14)
+    if e50 is None or r is None: return 55
+    trend = 60 if closes[-1] > e50 else 40
+    if r <= 30: base = 60 + (trend-50)//2
+    elif r >= 70: base = 60 + ((50-trend)//2)
+    else: base = 55
+    return max(50, min(80, int(base)))
+
+# === Symbol helpers ===
+def td_symbol(sym: str) -> str:
+    raw = sym.upper().replace("_","")
+    raw = raw[:-4] if raw.endswith("-OTC") else raw
+    if "/" in raw: return raw
+    return f"{raw[:3]}/{raw[3:6]}" if len(raw)>=6 else raw
+
+def alpha_from_to(sym: str):
+    raw = sym.upper().replace("/","")
+    raw = raw[:-4] if raw.endswith("-OTC") else raw
+    base = raw[:3]; quote = raw[3:6] if len(raw)>=6 else "USD"
+    return base, quote
+
+# === Data fetch ===
+async def fetch_closes_twelve(symbol: str, interval="5min", limit=120):
+    url = f"https://api.twelvedata.com/time_series?symbol={td_symbol(symbol)}&interval={interval}&outputsize={limit}&apikey={TWELVE_KEY}"
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=20) as r:
+                js = await r.json()
+                vals = js.get("values") or []
+                return [float(v["close"]) for v in reversed(vals)]
+    except Exception:
+        return []
+
+async def fetch_closes_alpha(symbol: str, interval="5min", limit=120):
+    base, quote = alpha_from_to(symbol)
+    if interval not in {"1min","5min","15min","30min","60min"}:
+        interval = "5min"
+    url = ( "https://www.alphavantage.co/query?"
+            f"function=FX_INTRADAY&from_symbol={base}&to_symbol={quote}"
+            f"&interval={interval}&apikey={ALPHA_KEY}&outputsize=compact")
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(url, timeout=20) as r:
+                js = await r.json()
+                ts = next((v for k,v in js.items() if "Time Series" in k), None)
+                if not ts: return []
+                items = sorted(ts.items())[-limit:]
+                return [float(v["4. close"]) for _,v in items]
+    except Exception:
+        return []
+
+async def fetch_closes(symbol, interval="5min", limit=120):
+    data = await fetch_closes_twelve(symbol, interval, limit)
+    if data: return data
+    return await fetch_closes_alpha(symbol, interval, limit)
+
+# === Commands ===
 async def start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("✅ Bot online.\n" + HELP_MSG)
+    await update.message.reply_text("✅ Bot online (signals only).\n" + HELP_TEXT)
 
 async def help_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(HELP_MSG)
+    await update.message.reply_text(HELP_TEXT)
+
+async def mode_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not ctx.args or ctx.args[0].lower() not in ("strict","active","both","ultra"):
+        return await update.message.reply_text("Usage: /mode strict|active|both|ultra")
+    STATE["mode"] = ctx.args[0].lower()
+    await update.message.reply_text(f"Mode set to {STATE['mode']}")
+
+async def check_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if len(ctx.args) not in (1,2):
+        return await update.message.reply_text("Usage: /check SYMBOL [tf=5min]")
+    symbol = ctx.args[0].upper()
+    tf = ctx.args[1] if len(ctx.args)==2 else DEFAULT_TF
+    closes = await fetch_closes(symbol, tf, 120)
+    if not closes:
+        return await update.message.reply_text("❌ No data right now.")
+    decision = decide(closes, STATE["mode"]) or "none"
+    conf = confidence_pct(closes)
+    await update.message.reply_text(
+        f"📊 {symbol} {tf}\nMode: {STATE['mode']}\nCandles: {len(closes)}\nDecision: {decision.upper()}\nConfidence: {conf}%\n\n(Manual entry only)"
+    )
+
+async def autosignal_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if STATE["auto"]:
+        return await update.message.reply_text("Already running. Use /stopsignal first.")
+    if len(ctx.args) not in (3,4,5):
+        return await update.message.reply_text(
+            "Usage: /autosignal SYMBOL AMOUNT DURATION [every=300] [tf=5min]\n"
+            "Example: /autosignal EURUSD-OTC 5 60 300 1min"
+        )
+    symbol = ctx.args[0].upper()
+    amount = float(ctx.args[1]); duration = int(ctx.args[2])
+    every = int(ctx.args[3]) if len(ctx.args)>=4 else DEFAULT_INTERVAL_SEC
+    tf = ctx.args[4] if len(ctx.args)==5 else DEFAULT_TF
+
+    STATE["auto"] = True
+
+    async def loop(chat_id):
+        await ctx.bot.send_message(chat_id, f"▶️ Auto-signal {symbol} | ${amount} | {duration}s | every {every}s | TF {tf} | mode {STATE['mode']}")
+        while STATE["auto"] and STATE["losses"] < LOSS_LIMIT:
+            closes = await fetch_closes(symbol, tf, 120)
+            if closes:
+                dec = decide(closes, STATE["mode"])
+                if dec:
+                    conf = confidence_pct(closes)
+                    arrow = "UP" if dec=="call" else "DOWN"
+                    await ctx.bot.send_message(chat_id,
+                        f"📣 SIGNAL\nPair: {symbol}\nDirection: {arrow}\nAmount: ${amount}\nDuration: {duration}s\nConfidence: {conf}%\n\n➡️ Manually place the trade.")
+            await asyncio.sleep(every)
+        STATE["auto"] = False
+        await ctx.bot.send_message(chat_id, "⏹ Auto-signal stopped.")
+
+    STATE["task"] = asyncio.create_task(loop(update.effective_chat.id))
+    await update.message.reply_text("Auto started.")
+
+async def stopsignal_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    STATE["auto"] = False
+    await update.message.reply_text("Stopping auto-signal...")
 
 async def result_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global STATS
-    if not ctx.args: return await update.message.reply_text("Usage: /result win|loss")
-    res = ctx.args[0].lower()
-    if res=="win": STATS["wins"]+=1
-    elif res=="loss": STATS["losses"]+=1
-    else: return await update.message.reply_text("Use win|loss only.")
-    if STATS["losses"] >= DAILY_LIMIT_LOSSES:
-        await update.message.reply_text("🛑 3 losses reached. Auto stopped.")
-    await update.message.reply_text(f"📊 W: {STATS['wins']} | L: {STATS['losses']}")
+    if not ctx.args or ctx.args[0].lower() not in ("win","loss"):
+        return await update.message.reply_text("Usage: /result win|loss")
+    if ctx.args[0].lower()=="win":
+        STATE["wins"] += 1
+    else:
+        STATE["losses"] += 1
+        if STATE["losses"] >= LOSS_LIMIT:
+            STATE["auto"] = False
+            await update.message.reply_text("🛑 Loss limit reached (3). Auto stopped.")
+    await stats_cmd(update, ctx)
 
 async def stats_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"📈 Stats:\nWins: {STATS['wins']}\nLosses: {STATS['losses']}")
+    tot = STATE["wins"] + STATE["losses"]
+    wr  = (STATE["wins"]/tot*100) if tot else 0.0
+    await update.message.reply_text(
+        f"📈 Stats\nWins: {STATE['wins']}  Losses: {STATE['losses']}  WR: {wr:.1f}%\nLoss limit: {LOSS_LIMIT}"
+    )
 
 async def reset_cmd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    STATS.update({"wins":0,"losses":0})
+    STATE.update({"wins":0,"losses":0})
     await update.message.reply_text("✅ Stats reset.")
 
-# ======= AUTO SIGNAL =======
-async def autosignal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global AUTO_RUNNING
-    if AUTO_RUNNING: return await update.message.reply_text("Already running.")
-    if len(ctx.args) < 3: return await update.message.reply_text("Usage: /autosignal SYMBOL AMOUNT DURATION")
-    symbol, amount, duration = ctx.args[0].upper(), float(ctx.args[1]), int(ctx.args[2])
-    AUTO_RUNNING = True
-    await update.message.reply_text(f"▶️ Auto signal ON for {symbol}")
-    while AUTO_RUNNING and STATS["losses"] < DAILY_LIMIT_LOSSES:
-        closes = await fetch_closes(symbol, TWELVE_KEY)
-        if not closes: closes = await fetch_closes(symbol, ALPHA_KEY, "alpha")
-        decision = decide(closes)
-        if decision:
-            await update.message.reply_text(f"📣 {symbol} → {decision.upper()} | ${amount} | {duration}s")
-        await asyncio.sleep(300)
-    AUTO_RUNNING = False
-    await update.message.reply_text("⏹ Auto stopped.")
-
-async def stopsignal(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    global AUTO_RUNNING
-    AUTO_RUNNING = False
-    await update.message.reply_text("🛑 Stopped auto signal.")
-
-# ======= MAIN =======
+# === Main ===
 def main():
     app = Application.builder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("help", help_cmd))
-    app.add_handler(CommandHandler("autosignal", autosignal))
-    app.add_handler(CommandHandler("stopsignal", stopsignal))
+    app.add_handler(CommandHandler("mode", mode_cmd))
+    app.add_handler(CommandHandler("check", check_cmd))
+    app.add_handler(CommandHandler("autosignal", autosignal_cmd))
+    app.add_handler(CommandHandler("stopsignal", stopsignal_cmd))
     app.add_handler(CommandHandler("result", result_cmd))
     app.add_handler(CommandHandler("stats", stats_cmd))
     app.add_handler(CommandHandler("reset", reset_cmd))
     app.run_polling()
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()
